@@ -1,3 +1,6 @@
+
+![alt_text](https://github.com/lancealot/scrubadub/blob/main/scrubadub.png?raw=true)
+
 # Scrubadub
 
 Scrubadub is a command-line tool that helps Ceph administrators optimize their cluster's scrub settings. It calculates recommended scrub parameters based on your cluster's OSD composition, PG distribution, and workload patterns.
