@@ -16,15 +16,35 @@ Ceph's default scrub settings are designed for small clusters. However, larger a
 
 ## Features
 
-- Supports mixed OSD types (HDD/SSD/NVMe)
-- Handles varying PG distributions
-- Optimizes for different workload patterns:
-  * Heavy Read
-  * Heavy Write
-  * Mixed Use
-  * Archival
-- Provides clear implementation commands
-- Includes backup and rollback guidance
+- Comprehensive OSD Analysis:
+  * Supports mixed OSD types (HDD/SSD/NVMe)
+  * Calculates per-device throughput and IOPS
+  * Estimates total cluster performance
+  * Handles varying PG distributions
+
+- Intelligent Scrub Scheduling:
+  * Calculates estimated scrub completion times
+  * Automatically adjusts settings to prevent falling behind
+  * Configures optimal scrub time windows
+  * Adapts to cluster size and performance
+
+- Workload Optimization:
+  * Heavy Read: Optimized for read-intensive workloads
+  * Heavy Write: Minimizes impact on write operations
+  * Mixed Use: Balanced for general workloads
+  * Archival: Maximizes scrub efficiency
+
+- Performance Analysis:
+  * Estimates maximum throughput and IOPS
+  * Predicts scrub completion times
+  * Warns about potential scheduling issues
+  * Suggests optimizations when needed
+
+- Implementation Support:
+  * Provides clear configuration commands
+  * Includes backup and rollback guidance
+  * Offers monitoring recommendations
+  * Suggests when to re-evaluate settings
 
 ## Quick Start
 
@@ -57,6 +77,12 @@ ceph config dump | grep -E 'scrub|osd_max_scrubs'
 ```
 
 5. Follow the prompts to input your cluster's information.
+
+6. Review the analysis output:
+   - Device performance estimates
+   - Expected scrub completion times
+   - Recommended configuration changes
+   - Performance impact warnings
 
 ## Documentation
 

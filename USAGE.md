@@ -1,7 +1,7 @@
 # Scrubadub Usage Guide
 
 ## Overview
-Scrubadub is a tool that helps calculate optimal scrub settings for Ceph clusters. It takes into account your cluster's OSD composition, PG distribution, and workload patterns to recommend scrub parameters that balance data integrity with cluster performance.
+Scrubadub is a tool that helps calculate optimal scrub settings for Ceph clusters. It takes into account your cluster's OSD composition, PG distribution, and workload patterns to recommend scrub parameters that balance data integrity with cluster performance. The tool now includes performance analysis, scrub time estimation, and automatic adjustments to prevent falling behind on scrubs.
 
 ## Prerequisites
 Before running scrubadub, gather the following information from your Ceph cluster:
@@ -60,14 +60,29 @@ The script provides:
 - `osd_max_scrubs`: Maximum concurrent scrubs per OSD
 - `osd_scrub_load_threshold`: Maximum load before scrubs are deferred
 - `osd_scrub_sleep`: Time to sleep between operations (microseconds)
+- `osd_scrub_begin_hour`: Hour to begin allowing scrubs (0-23)
+- `osd_scrub_end_hour`: Hour to stop allowing scrubs (0-23)
 
 ### Default Values
 - `osd_scrub_min_interval`: 86400 (24 hours)
 - `osd_scrub_max_interval`: 604800 (7 days)
 - `osd_deep_scrub_interval`: 604800 (7 days)
-- `osd_max_scrubs`: 1
+- `osd_max_scrubs`: 1 (may be increased based on scrub time estimates)
 - `osd_scrub_load_threshold`: 0.5
 - `osd_scrub_sleep`: 0
+- `osd_scrub_begin_hour`: 1 (1 AM)
+- `osd_scrub_end_hour`: 7 (7 AM)
+
+### Performance Characteristics
+The tool uses these baseline performance metrics for calculations:
+- HDDs: ~150 MB/s, ~125 IOPS
+- SSDs: ~475 MB/s, ~70,000 IOPS
+- NVMe: ~2,750 MB/s, ~600,000 IOPS
+
+These values are used to estimate:
+- Total cluster throughput
+- Expected scrub completion times
+- Whether adjustments to max_scrubs are needed
 
 ## Best Practices
 
@@ -76,20 +91,24 @@ The script provides:
    ```bash
    ceph config dump | grep -E 'scrub|osd_max_scrubs' > ceph_scrub_settings_backup_$(date +%Y%m%d).txt
    ```
-2. Review the proposed changes
+2. Review the proposed changes and performance impact analysis
 3. Consider testing in a non-production environment
+4. Note the estimated scrub completion time for monitoring
 
 ### After Applying Changes
 1. Monitor cluster performance for 24-48 hours
 2. Watch for scrub-related issues in cluster logs
-3. Be prepared to restore original settings if needed
+3. Compare actual scrub completion times with estimates
+4. Be prepared to restore original settings if needed
 
 ### When to Re-run
-Re-run the scrubadub tool when:
+Re-run the scrubdub tool when:
 - Cluster size changes significantly
 - Workload patterns change
 - New OSD types are added
 - Performance issues are observed
+- Actual scrub times differ significantly from estimates
+- PG distribution changes substantially
 
 ## Troubleshooting
 
@@ -98,23 +117,35 @@ Re-run the scrubadub tool when:
    - Check PG distribution
    - Consider increasing max_scrubs
    - Review load threshold
+   - Verify scrub window hours are appropriate
 
 2. Performance impact too high
    - Increase scrub_sleep
    - Decrease load threshold
    - Reduce max_scrubs
+   - Adjust scrub window to off-peak hours
 
 3. Scrubs falling behind
-   - Increase max_scrubs
-   - Review interval settings
+   - Compare actual vs. estimated scrub times
+   - Review throughput estimates vs. actual
+   - Increase max_scrubs if needed
+   - Consider extending scrub window
    - Check for other cluster issues
+
+4. Uneven scrub distribution
+   - Review PG distribution across OSDs
+   - Check for device performance outliers
+   - Consider rebalancing if necessary
 
 ### Monitoring
 Monitor these metrics to assess scrub impact:
 - OSD load averages
 - Client latency during scrubs
-- Scrub completion times
+- Scrub completion times vs. estimates
 - Recovery queue length
+- Device throughput vs. estimates
+- IOPS impact during scrubs
+- Scrub window utilization
 
 ## Example Usage
 
