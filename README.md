@@ -50,7 +50,7 @@ Ceph's default scrub settings are designed for small clusters. However, larger a
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/scrubadub.git
+git clone https://github.com/lancealot/scrubadub.git
 cd scrubadub
 ```
 
