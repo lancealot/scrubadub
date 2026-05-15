@@ -47,6 +47,11 @@ HYPERCONVERGED=0
 AGGRESSIVE_SCRUBS=0
 DEVICE_PROFILE=""
 
+# Phase 1: cluster-ingested mode.
+FROM_CLUSTER=0
+FORCE_NON_MON=0
+WORKLOAD_TYPE=""   # 1/2/3/4; if set via --workload, skips the prompt
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -71,14 +76,26 @@ usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
 
-Options:
-  --avg-pg-size-gb N      Average PG size in GB (default: 4, a guess).
-  --replica-size N        Treat pools as N-way replicated (default: 3).
+Cluster-ingested mode (Phase 1):
+  --from-cluster          Read OSD inventory, PG distribution, pool sizes,
+                          current scrub config, scheduler, and scrub
+                          backlog directly from 'ceph' instead of prompting.
+                          Requires ceph + jq on PATH. Run on a mon node.
+  --force                 Allow --from-cluster on a host that doesn't look
+                          like a monitor. Footgun; off by default.
+  --workload {read|write|mixed|archive}
+                          Skip the workload prompt by declaring up front.
+
+Tuning options:
+  --avg-pg-size-gb N      Average PG size in GB (default: 4 in prompt mode,
+                          computed from 'ceph df detail' under --from-cluster).
+  --replica-size N        Treat pools as N-way replicated (default: 3 in
+                          prompt mode, computed per-pool under --from-cluster).
   --ec-ratio k+m          Treat pools as erasure-coded k+m (e.g. 8+3).
                           Mutually exclusive with --replica-size.
   --scheduler {wpq|mclock}
-                          Active OSD op scheduler. Prompted if omitted.
-                          mClock suppresses settings it ignores.
+                          Active OSD op scheduler. Auto-detected under
+                          --from-cluster; prompted otherwise.
   --hyperconverged        Other workloads share the OSD hosts (Proxmox,
                           OpenStack co-located VMs, etc.). Allows lower
                           osd_scrub_load_threshold values under WPQ.
@@ -93,9 +110,11 @@ Environment variables:
   PG_SIZE_GB              Same as --avg-pg-size-gb.
   SCRUB_BUDGET_PERCENT    Percent of cluster throughput available for
                           scrub (default: 10).
+  CEPH_FIXTURE_DIR        Replace live 'ceph' calls with fixture files in
+                          the given directory. For testing.
   Plus any device constant from --device-profile.
 
-See ROADMAP.md for the phased plan, including --from-cluster (Phase 1).
+See ROADMAP.md for the phased plan.
 EOF
 }
 
@@ -157,6 +176,22 @@ parse_args() {
             --device-profile)
                 require_value "$1" "${2:-}"
                 DEVICE_PROFILE="$2"
+                shift 2 ;;
+            --from-cluster)
+                FROM_CLUSTER=1
+                shift ;;
+            --force)
+                FORCE_NON_MON=1
+                shift ;;
+            --workload)
+                require_value "$1" "${2:-}"
+                case "$2" in
+                    read)    WORKLOAD_TYPE=1 ;;
+                    write)   WORKLOAD_TYPE=2 ;;
+                    mixed)   WORKLOAD_TYPE=3 ;;
+                    archive) WORKLOAD_TYPE=4 ;;
+                    *) print_error "--workload must be read, write, mixed, or archive"; exit 2 ;;
+                esac
                 shift 2 ;;
             -h|--help)
                 usage
@@ -365,94 +400,421 @@ calculate_scrub_settings() {
 }
 
 # -----------------------------------------------------------------------------
+# Phase 1 — ceph CLI shim and cluster-ingest helpers
+# -----------------------------------------------------------------------------
+
+# run_ceph runs `ceph $@` against the live cluster, OR reads from a fixture
+# file under $CEPH_FIXTURE_DIR when that env var is set. The mapping
+# command-line → fixture-file is explicit and limited to the calls we make.
+run_ceph() {
+    if [ -n "${CEPH_FIXTURE_DIR:-}" ]; then
+        local fixture=""
+        case "$*" in
+            "osd tree --format json")              fixture="osd_tree.json" ;;
+            "osd df tree --format json")           fixture="osd_df_tree.json" ;;
+            "osd pool ls detail --format json")    fixture="osd_pool_ls_detail.json" ;;
+            "df detail --format json")             fixture="df_detail.json" ;;
+            "config dump --format json")           fixture="config_dump.json" ;;
+            "config get osd osd_op_queue")         fixture="osd_op_queue.txt" ;;
+            "pg dump pgs_brief --format json")     fixture="pg_dump_pgs_brief.json" ;;
+            "version")                              fixture="version.txt" ;;
+            *)
+                print_error "run_ceph: no fixture mapped for: ceph $*"
+                return 1 ;;
+        esac
+        if [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ]; then
+            print_error "Fixture not readable: $CEPH_FIXTURE_DIR/$fixture"
+            return 1
+        fi
+        cat "$CEPH_FIXTURE_DIR/$fixture"
+    else
+        # shellcheck disable=SC2068
+        ceph $@
+    fi
+}
+
+# Phase 1.1, 1.9: validate prerequisites for cluster ingest.
+check_ceph_environment() {
+    if [ -z "${CEPH_FIXTURE_DIR:-}" ]; then
+        command -v ceph >/dev/null 2>&1 || {
+            print_error "'ceph' not found in PATH. --from-cluster must run on a node with the ceph client installed."
+            exit 3
+        }
+    fi
+    command -v jq >/dev/null 2>&1 || {
+        print_error "'jq' not found in PATH. Install jq (it ships on Ceph nodes anyway) or omit --from-cluster."
+        exit 3
+    }
+
+    # Phase 1.9: mon-node detection.
+    if [ -n "${CEPH_FIXTURE_DIR:-}" ]; then
+        return 0  # fixture mode bypasses
+    fi
+    if [ "$FORCE_NON_MON" -eq 1 ]; then
+        print_warning "--force: skipping mon-node check."
+        return 0
+    fi
+    if [ -d /var/lib/ceph/mon ] || [ -r /etc/ceph/ceph.client.admin.keyring ]; then
+        return 0
+    fi
+    print_error "Doesn't look like a Ceph monitor node (no /var/lib/ceph/mon and no admin keyring)."
+    print_error "Some 'ceph' commands are slow or unauthorized off a mon. Pass --force to override."
+    exit 3
+}
+
+# Phase 1.2: device-class OSD counts + max OSDs/host.
+osds_per_host_max=0
+ingest_osd_inventory() {
+    local tree
+    tree=$(run_ceph osd tree --format json) || exit 4
+
+    hdd_count=$(echo "$tree" | jq '[.nodes[] | select(.type=="osd" and .device_class=="hdd")] | length')
+    ssd_count=$(echo "$tree" | jq '[.nodes[] | select(.type=="osd" and .device_class=="ssd")] | length')
+    nvme_count=$(echo "$tree" | jq '[.nodes[] | select(.type=="osd" and .device_class=="nvme")] | length')
+
+    # max OSDs per host (for the Phase 0.3 per-host concurrency warning).
+    osds_per_host_max=$(echo "$tree" | jq '
+        [.nodes[] | select(.type=="host") | .children | length] | max // 0')
+
+    print_notice "OSD inventory: HDD=$hdd_count SSD=$ssd_count NVMe=$nvme_count; max OSDs/host=$osds_per_host_max"
+}
+
+# Phase 1.3: per-device-class PG counts + stddev/mean warning.
+pg_imbalance_warning=""
+ingest_pg_distribution() {
+    local df
+    df=$(run_ceph osd df tree --format json) || exit 4
+
+    hdd_pg_count=$(echo "$df" | jq '[.nodes[] | select(.device_class=="hdd") | .pgs] | add // 0')
+    ssd_pg_count=$(echo "$df" | jq '[.nodes[] | select(.device_class=="ssd") | .pgs] | add // 0')
+    nvme_pg_count=$(echo "$df" | jq '[.nodes[] | select(.device_class=="nvme") | .pgs] | add // 0')
+
+    # PG variance per class: stddev/mean > 0.15 triggers a rebalance hint.
+    local report
+    report=$(echo "$df" | jq -r '
+        def avg: add / length;
+        def stddev: . as $a | ($a | avg) as $m | ($a | map((. - $m) * (. - $m)) | avg | sqrt);
+        ["hdd","ssd","nvme"][] as $c
+        | [.nodes[] | select(.device_class==$c) | .pgs] as $pgs
+        | if ($pgs | length) > 1 then
+            ($pgs | avg) as $m | ($pgs | stddev) as $s
+            | if $m > 0 and ($s / $m) > 0.15 then
+                "\($c) imbalanced: stddev/mean=\(($s / $m * 100) | floor)% across \($pgs | length) OSDs"
+              else empty end
+          else empty end
+    ')
+    if [ -n "$report" ]; then
+        pg_imbalance_warning="$report"
+    fi
+    print_notice "PG distribution: HDD=$hdd_pg_count SSD=$ssd_pg_count NVMe=$nvme_pg_count"
+    if [ -n "$pg_imbalance_warning" ]; then
+        while IFS= read -r line; do
+            print_warning "PG imbalance — $line"
+        done <<< "$pg_imbalance_warning"
+        print_warning "Consider 'ceph osd reweight-by-pg' or the pg_autoscaler before tuning scrubs."
+    fi
+}
+
+# Phase 1.4: compute weighted-average PG size from real per-pool data.
+# Updates AVG_PG_SIZE and AVG_PG_SIZE_SOURCE if the user didn't override.
+# Also derives DATA_FACTOR if it was left at the default — uses the
+# largest pool's overhead, since deep-scrub time is dominated by it.
+ingest_pool_details() {
+    local pools df pool_rows
+    pools=$(run_ceph osd pool ls detail --format json) || exit 4
+    df=$(run_ceph df detail --format json) || exit 4
+
+    # Per-pool rows: name, stored_bytes, pg_num, replica_size, ec_k+m_or_blank
+    pool_rows=$(echo "$pools" "$df" | jq -s -r '
+        .[0] as $pools | .[1] as $df
+        | $pools[] | . as $p
+        | ($df.pools[] | select(.id == $p.pool_id)) as $d
+        | {
+            name: $p.pool_name,
+            stored: ($d.stats.stored // 0),
+            pg_num: $p.pg_num,
+            type: $p.type,                # 1=replicated, 3=erasure
+            size: $p.size,                # replica size (or k+m for EC)
+            ec_profile: $p.erasure_code_profile
+          }
+        | "\(.name)\t\(.stored)\t\(.pg_num)\t\(.type)\t\(.size)\t\(.ec_profile)"
+    ')
+
+    # Walk rows, summing stored and weighted PG-size; pick the largest pool.
+    local total_stored=0
+    local total_pgs=0
+    local largest_name="" largest_stored=0 largest_factor_num=3 largest_factor_den=1
+    local row_count=0
+    while IFS=$'\t' read -r name stored pg_num ptype psize ec_profile; do
+        [ -z "$name" ] && continue
+        row_count=$((row_count + 1))
+        total_stored=$((total_stored + stored))
+        total_pgs=$((total_pgs + pg_num))
+
+        # Determine read-overhead factor for this pool.
+        local factor_num=3 factor_den=1
+        if [ "$ptype" = "3" ]; then
+            # EC pool: psize is k+m on Ceph >= reef. Try to parse k+m from ec_profile name.
+            if [[ "$ec_profile" =~ ec-([0-9]+)-([0-9]+) ]]; then
+                local k="${BASH_REMATCH[1]}"
+                local m="${BASH_REMATCH[2]}"
+                factor_num=$((k + m))
+                factor_den=$k
+            else
+                # Fallback: assume psize == k+m and k=size-2 (typical default profile k+2).
+                factor_num=$psize
+                factor_den=$((psize - 2 > 0 ? psize - 2 : 1))
+            fi
+        else
+            factor_num=$psize
+            factor_den=1
+        fi
+
+        if [ "$stored" -gt "$largest_stored" ]; then
+            largest_stored=$stored
+            largest_name=$name
+            largest_factor_num=$factor_num
+            largest_factor_den=$factor_den
+        fi
+    done <<< "$pool_rows"
+
+    # Compute weighted average PG size in GB.
+    if [ "$total_pgs" -gt 0 ] && [ "$total_stored" -gt 0 ] && [ "$AVG_PG_SIZE_SOURCE" = "default" ]; then
+        # MB per PG = (stored bytes / 1MB) / total PGs; divide MB by 1024 to get GB.
+        local mb_per_pg=$((total_stored / 1048576 / total_pgs))
+        local gb_per_pg=$((mb_per_pg / 1024))
+        [ "$gb_per_pg" -lt 1 ] && gb_per_pg=1
+        AVG_PG_SIZE=$gb_per_pg
+        AVG_PG_SIZE_SOURCE="cluster avg (${total_pgs} PGs across ${row_count} pools)"
+    fi
+
+    # Adopt the largest pool's data factor if the user didn't override.
+    if [ "$DATA_FACTOR_SOURCE" = "default (3x replicated)" ] && [ -n "$largest_name" ]; then
+        DATA_FACTOR_NUM=$largest_factor_num
+        DATA_FACTOR_DEN=$largest_factor_den
+        DATA_FACTOR_SOURCE="largest pool '$largest_name' (${largest_factor_num}/${largest_factor_den})"
+    fi
+
+    print_notice "Pools: $row_count; total stored: $((total_stored / 1073741824)) GB; avg PG size: $AVG_PG_SIZE GB"
+}
+
+# Phase 1.6: read scheduler from the cluster.
+ingest_scheduler() {
+    local q
+    q=$(run_ceph config get osd osd_op_queue 2>/dev/null | tr -d '[:space:]')
+    case "$q" in
+        wpq)
+            SCHEDULER="wpq" ;;
+        mclock_scheduler|mclock)
+            SCHEDULER="mclock" ;;
+        "")
+            print_warning "Could not read osd_op_queue from cluster; defaulting to wpq."
+            SCHEDULER="wpq" ;;
+        *)
+            print_warning "Unknown osd_op_queue value '$q'; defaulting to wpq."
+            SCHEDULER="wpq" ;;
+    esac
+    print_notice "Active OSD op scheduler: $SCHEDULER"
+}
+
+# Phase 1.5: read current values for each parameter we recommend.
+# Populates current_config_<param> globals (one per param we care about).
+ingest_current_config() {
+    local cfg
+    cfg=$(run_ceph config dump --format json) || exit 4
+
+    # Helper: look up by name, return value or empty string.
+    _cfg_lookup() {
+        echo "$cfg" | jq -r --arg name "$1" '
+            [.[] | select(.name==$name) | .value] | first // ""
+        '
+    }
+
+    current_osd_scrub_min_interval=$(_cfg_lookup osd_scrub_min_interval)
+    current_osd_scrub_max_interval=$(_cfg_lookup osd_scrub_max_interval)
+    current_osd_deep_scrub_interval=$(_cfg_lookup osd_deep_scrub_interval)
+    current_osd_max_scrubs=$(_cfg_lookup osd_max_scrubs)
+    current_osd_scrub_sleep=$(_cfg_lookup osd_scrub_sleep)
+    current_osd_scrub_load_threshold=$(_cfg_lookup osd_scrub_load_threshold)
+    current_osd_scrub_begin_hour=$(_cfg_lookup osd_scrub_begin_hour)
+    current_osd_scrub_end_hour=$(_cfg_lookup osd_scrub_end_hour)
+    current_osd_scrub_interval_randomize_ratio=$(_cfg_lookup osd_scrub_interval_randomize_ratio)
+    current_osd_mclock_profile=$(_cfg_lookup osd_mclock_profile)
+}
+
+# Phase 1.7: scrub backlog summary. Counts PGs whose last_deep_scrub_stamp
+# (and last_scrub_stamp) are older than the configured interval.
+backlog_summary=""
+ingest_scrub_backlog() {
+    local pgs now_epoch
+    pgs=$(run_ceph pg dump pgs_brief --format json) || exit 4
+    now_epoch=$(date +%s)
+
+    local deep_iv="${current_osd_deep_scrub_interval:-604800}"
+    local scrub_iv="${current_osd_scrub_max_interval:-604800}"
+
+    local total_pgs deep_late=0 scrub_late=0
+    total_pgs=$(echo "$pgs" | jq '.pg_stats | length')
+
+    # jq emits "<deep_stamp> <scrub_stamp>" lines; we parse each timestamp
+    # with `date -d` (GNU date handles the subseconds and +0000 zone).
+    local deep_stamp scrub_stamp deep_epoch scrub_epoch
+    while read -r deep_stamp scrub_stamp; do
+        [ -z "$deep_stamp" ] && continue
+        deep_epoch=$(date -d "${deep_stamp//+0000/+00:00}" +%s 2>/dev/null || echo 0)
+        scrub_epoch=$(date -d "${scrub_stamp//+0000/+00:00}" +%s 2>/dev/null || echo 0)
+        if [ "$deep_epoch" -gt 0 ] && [ $((now_epoch - deep_epoch)) -gt "$deep_iv" ]; then
+            deep_late=$((deep_late + 1))
+        fi
+        if [ "$scrub_epoch" -gt 0 ] && [ $((now_epoch - scrub_epoch)) -gt "$scrub_iv" ]; then
+            scrub_late=$((scrub_late + 1))
+        fi
+    done < <(echo "$pgs" | jq -r '.pg_stats[] | "\(.last_deep_scrub_stamp) \(.last_scrub_stamp)"')
+
+    backlog_summary="${total_pgs} PGs total; ${scrub_late} past scrub interval (${scrub_iv}s); ${deep_late} past deep-scrub interval (${deep_iv}s)"
+}
+
+# Phase 1.5: render proposed settings as a current → proposed diff.
+# Reads proposed lines (from calculate_scrub_settings) on stdin.
+render_diff() {
+    local changes=0
+    while IFS= read -r line; do
+        # Each line: "param = value"
+        local param="${line% = *}"
+        local proposed="${line#* = }"
+        local current_var="current_${param}"
+        local current="${!current_var:-(unset)}"
+        if [ "$current" = "$proposed" ]; then
+            printf "  %-42s %s (no change)\n" "$param:" "$current"
+        else
+            printf "  %-42s ${YELLOW}%s → %s${NC}\n" "$param:" "$current" "$proposed"
+            changes=$((changes + 1))
+        fi
+    done
+    echo
+    if [ "$changes" -eq 0 ]; then
+        print_success "No changes — current config already matches recommendations."
+    else
+        print_notice "$changes parameter(s) would change. Backup before applying."
+    fi
+}
+
+prompt_workload() {
+    while true; do
+        echo
+        echo "Select primary workload type:"
+        echo "  1) Heavy Read"
+        echo "  2) Heavy Write"
+        echo "  3) Mixed Use"
+        echo "  4) Archival"
+        read -p "Enter selection (1-4): " WORKLOAD_TYPE
+        [[ "$WORKLOAD_TYPE" =~ ^[1-4]$ ]] && break
+        print_error "Please enter a number between 1 and 4"
+    done
+}
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 parse_args "$@"
 load_device_profile
 
-print_header "Ceph Scrub Parameter Calculator"
-echo "Calculates recommended scrub settings from OSD composition,"
-echo "PG distribution, workload type, and the active op scheduler."
-echo
-echo "See ROADMAP.md for tracked improvements (Phase 1: --from-cluster auto-ingest)."
-echo
-
-# Banners about default assumptions (Phase 0.5, 0.10, 0.11).
-if [ "$AVG_PG_SIZE_SOURCE" = "default" ]; then
-    print_notice "Using default avg PG size = ${AVG_PG_SIZE_DEFAULT} GB. Real PG size varies"
-    print_notice "  wildly per pool. Override with --avg-pg-size-gb N; Phase 1.4 will compute"
-    print_notice "  this from 'ceph df detail'."
-fi
-if [ "$DATA_FACTOR_SOURCE" = "default (3x replicated)" ]; then
-    print_notice "Assuming 3x replicated pools (deep-scrub reads 3x stored bytes)."
-    print_notice "  Override with --replica-size N or --ec-ratio k+m."
-fi
-if [ -z "$DEVICE_PROFILE" ]; then
-    print_notice "Using built-in device baselines. Override with --device-profile <file>."
-fi
-
-# OSD inventory
-while true; do
-    read -p "Enter number of HDD OSDs: " hdd_count
-    read -p "Enter number of SSD OSDs: " ssd_count
-    read -p "Enter number of NVMe OSDs: " nvme_count
-    validate_osd_inputs "$hdd_count" "$ssd_count" "$nvme_count" && break
-done
-
-# PG counts
-if [ "$hdd_count" -gt 0 ]; then
-    while true; do
-        read -p "Enter total PG count for HDD OSDs: " hdd_pg_count
-        validate_pg_inputs "$hdd_pg_count" "$hdd_count" "HDD" && break
-    done
-else
-    hdd_pg_count=0
-fi
-if [ "$ssd_count" -gt 0 ]; then
-    while true; do
-        read -p "Enter total PG count for SSD OSDs: " ssd_pg_count
-        validate_pg_inputs "$ssd_pg_count" "$ssd_count" "SSD" && break
-    done
-else
-    ssd_pg_count=0
-fi
-if [ "$nvme_count" -gt 0 ]; then
-    while true; do
-        read -p "Enter total PG count for NVMe OSDs: " nvme_pg_count
-        validate_pg_inputs "$nvme_pg_count" "$nvme_count" "NVMe" && break
-    done
-else
-    nvme_pg_count=0
-fi
-
-# Workload
-while true; do
+# --- Input gathering: branch on --from-cluster (Phase 1.1, 1.8) -----------
+if [ "$FROM_CLUSTER" -eq 1 ]; then
+    print_header "Ceph Scrub Parameter Calculator — cluster-ingested mode"
+    echo "Reading OSD inventory, PG distribution, pool sizes, current scrub"
+    echo "config, scheduler, and scrub backlog from 'ceph'."
     echo
-    echo "Select primary workload type:"
-    echo "  1) Heavy Read"
-    echo "  2) Heavy Write"
-    echo "  3) Mixed Use"
-    echo "  4) Archival"
-    read -p "Enter selection (1-4): " workload_type
-    [[ "$workload_type" =~ ^[1-4]$ ]] && break
-    print_error "Please enter a number between 1 and 4"
-done
+    if [ -n "${CEPH_FIXTURE_DIR:-}" ]; then
+        print_notice "CEPH_FIXTURE_DIR=$CEPH_FIXTURE_DIR — using fixtures instead of live ceph."
+    fi
+    check_ceph_environment
 
-# Scheduler — Phase 0.6.
-if [ -z "$SCHEDULER" ]; then
-    while true; do
+    ingest_osd_inventory          # 1.2
+    ingest_pg_distribution        # 1.3
+    ingest_pool_details           # 1.4
+    ingest_scheduler              # 1.6
+    ingest_current_config         # 1.5
+    ingest_scrub_backlog          # 1.7
+
+    if [ -z "$WORKLOAD_TYPE" ]; then
         echo
-        echo "Which OSD op scheduler is active on your cluster?"
-        echo "  Check with: ceph config get osd osd_op_queue"
-        echo "  1) WPQ   (default pre-Quincy; many production clusters still use this)"
-        echo "  2) mClock (default since Ceph 17 / Quincy)"
-        read -p "Enter selection (1 or 2): " sched_choice
-        case "$sched_choice" in
-            1) SCHEDULER="wpq"; break ;;
-            2) SCHEDULER="mclock"; break ;;
-            *) print_error "Please enter 1 or 2" ;;
-        esac
+        echo "Workload type can't be auto-detected — pass --workload to skip this prompt."
+        prompt_workload
+    fi
+else
+    print_header "Ceph Scrub Parameter Calculator — prompt mode"
+    echo "Calculates recommended scrub settings from OSD composition,"
+    echo "PG distribution, workload type, and the active op scheduler."
+    echo
+    echo "For cluster auto-ingest on a mon node, re-run with --from-cluster."
+    echo
+
+    # Banners about default assumptions (Phase 0.5, 0.10, 0.11).
+    if [ "$AVG_PG_SIZE_SOURCE" = "default" ]; then
+        print_notice "Using default avg PG size = ${AVG_PG_SIZE_DEFAULT} GB. Real PG size varies"
+        print_notice "  wildly per pool. Override with --avg-pg-size-gb N or --from-cluster."
+    fi
+    if [ "$DATA_FACTOR_SOURCE" = "default (3x replicated)" ]; then
+        print_notice "Assuming 3x replicated pools (deep-scrub reads 3x stored bytes)."
+        print_notice "  Override with --replica-size N, --ec-ratio k+m, or --from-cluster."
+    fi
+    if [ -z "$DEVICE_PROFILE" ]; then
+        print_notice "Using built-in device baselines. Override with --device-profile <file>."
+    fi
+
+    # OSD inventory
+    while true; do
+        read -p "Enter number of HDD OSDs: " hdd_count
+        read -p "Enter number of SSD OSDs: " ssd_count
+        read -p "Enter number of NVMe OSDs: " nvme_count
+        validate_osd_inputs "$hdd_count" "$ssd_count" "$nvme_count" && break
     done
+
+    # PG counts
+    if [ "$hdd_count" -gt 0 ]; then
+        while true; do
+            read -p "Enter total PG count for HDD OSDs: " hdd_pg_count
+            validate_pg_inputs "$hdd_pg_count" "$hdd_count" "HDD" && break
+        done
+    else
+        hdd_pg_count=0
+    fi
+    if [ "$ssd_count" -gt 0 ]; then
+        while true; do
+            read -p "Enter total PG count for SSD OSDs: " ssd_pg_count
+            validate_pg_inputs "$ssd_pg_count" "$ssd_count" "SSD" && break
+        done
+    else
+        ssd_pg_count=0
+    fi
+    if [ "$nvme_count" -gt 0 ]; then
+        while true; do
+            read -p "Enter total PG count for NVMe OSDs: " nvme_pg_count
+            validate_pg_inputs "$nvme_pg_count" "$nvme_count" "NVMe" && break
+        done
+    else
+        nvme_pg_count=0
+    fi
+
+    [ -z "$WORKLOAD_TYPE" ] && prompt_workload
+
+    # Scheduler — Phase 0.6.
+    if [ -z "$SCHEDULER" ]; then
+        while true; do
+            echo
+            echo "Which OSD op scheduler is active on your cluster?"
+            echo "  Check with: ceph config get osd osd_op_queue"
+            echo "  1) WPQ   (default pre-Quincy; many production clusters still use this)"
+            echo "  2) mClock (default since Ceph 17 / Quincy)"
+            read -p "Enter selection (1 or 2): " sched_choice
+            case "$sched_choice" in
+                1) SCHEDULER="wpq"; break ;;
+                2) SCHEDULER="mclock"; break ;;
+                *) print_error "Please enter 1 or 2" ;;
+            esac
+        done
+    fi
 fi
 
 # Scheduler banner — Phase 0.6.
@@ -531,7 +893,25 @@ for pair in "$hdd_count:$hdd_pg_count" "$ssd_count:$ssd_pg_count" "$nvme_count:$
 done
 
 # Capture the scrub window for the Notes section (Phase 0.2-aware).
-read -r display_begin display_end <<< "$(scrub_window_for_workload "$workload_type")"
+read -r display_begin display_end <<< "$(scrub_window_for_workload "$WORKLOAD_TYPE")"
+
+# Collect proposed settings once so we can render both a diff and the apply commands.
+proposed_settings=()
+while IFS= read -r line; do
+    proposed_settings+=("$line")
+done < <(calculate_scrub_settings "$total_osds" "$max_pg_per_osd" "$WORKLOAD_TYPE" "$estimated_scrub_time" "$SCHEDULER")
+
+# Phase 1.7: backlog summary in cluster mode.
+if [ "$FROM_CLUSTER" -eq 1 ] && [ -n "$backlog_summary" ]; then
+    print_header "Scrub Backlog (from 'ceph pg dump pgs_brief')"
+    echo "  $backlog_summary"
+fi
+
+# Phase 1.5: current → proposed diff in cluster mode.
+if [ "$FROM_CLUSTER" -eq 1 ]; then
+    print_header "Proposed Changes (current → proposed)"
+    printf '%s\n' "${proposed_settings[@]}" | render_diff
+fi
 
 print_header "Current Configuration Backup Commands"
 echo "# Run these on your cluster to back up the current settings:"
@@ -540,11 +920,9 @@ echo "  > ceph_scrub_settings_backup_\$(date +%Y%m%d_%H%M%S).txt"
 
 print_header "Recommended Configuration Commands"
 echo "# Run these on your cluster to apply the recommended settings:"
-IFS=$'\n'
-for setting in $(calculate_scrub_settings "$total_osds" "$max_pg_per_osd" "$workload_type" "$estimated_scrub_time" "$SCHEDULER"); do
+for setting in "${proposed_settings[@]}"; do
     echo "ceph config set osd ${setting// = / }"
 done
-unset IFS
 
 print_header "Performance Impact Analysis"
 echo "Scrub Schedule Analysis:"

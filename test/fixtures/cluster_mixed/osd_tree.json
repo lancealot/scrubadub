@@ -1,0 +1,20 @@
+{
+  "nodes": [
+    {"id": -1, "name": "default", "type": "root", "type_id": 10, "children": [-2, -3, -4]},
+    {"id": -2, "name": "host-a", "type": "host", "type_id": 1, "children": [0, 1, 2, 3]},
+    {"id": -3, "name": "host-b", "type": "host", "type_id": 1, "children": [4, 5, 6, 7]},
+    {"id": -4, "name": "host-c", "type": "host", "type_id": 1, "children": [8, 9, 10, 11]},
+    {"id": 0,  "name": "osd.0",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 1,  "name": "osd.1",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 2,  "name": "osd.2",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 3,  "name": "osd.3",  "type": "osd", "type_id": 0, "device_class": "ssd",  "status": "up"},
+    {"id": 4,  "name": "osd.4",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 5,  "name": "osd.5",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 6,  "name": "osd.6",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 7,  "name": "osd.7",  "type": "osd", "type_id": 0, "device_class": "ssd",  "status": "up"},
+    {"id": 8,  "name": "osd.8",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 9,  "name": "osd.9",  "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 10, "name": "osd.10", "type": "osd", "type_id": 0, "device_class": "hdd",  "status": "up"},
+    {"id": 11, "name": "osd.11", "type": "osd", "type_id": 0, "device_class": "ssd",  "status": "up"}
+  ]
+}

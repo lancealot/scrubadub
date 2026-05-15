@@ -33,25 +33,34 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1.1)
+## Current baseline (v1.2)
 
-After Phase 0:
+After Phase 0 and Phase 1:
 
-- Scheduler-aware: detects (via prompt or `--scheduler`) WPQ vs mClock
-  and suppresses settings mClock ignores. Recommends an
-  `osd_mclock_profile` under mClock.
-- `osd_scrub_sleep` is now seconds-typed (floats); `osd_max_scrubs`
-  capped at 2 by default (3 with `--aggressive-scrubs`).
-- Emits `osd_scrub_interval_randomize_ratio` to avoid synchronized
-  scrub storms.
-- Replication / EC factor honored via `--replica-size` / `--ec-ratio`
-  (default 3× replicated).
-- Scrub-time estimate uses a `SCRUB_BUDGET_PERCENT` (default 10%) of
-  total throughput instead of pretending scrubs get 100%.
+Cluster ingest (Phase 1):
+- `--from-cluster` reads OSD inventory, per-class PG distribution
+  with variance, per-pool data (sizes, replica / EC), current scrub
+  config, scheduler, and the scrub backlog from a Ceph mon node via
+  `ceph` + `jq`. Refuses to run off a mon unless `--force` is given.
+- `--avg-pg-size-gb` and the data factor are computed from the
+  cluster's real numbers instead of the 4 GB / 3× defaults.
+- Output adds a `current → proposed` diff and a scrub-backlog summary.
+- `--workload {read|write|mixed|archive}` allows fully non-interactive
+  operation when paired with `--from-cluster`.
+- Fixture-driven testing: `CEPH_FIXTURE_DIR=test/fixtures/cluster_mixed`
+  + `bash test/smoke.sh` exercises both modes without a real cluster.
+
+Carries over from Phase 0:
+- Scheduler-aware: detects WPQ vs mClock and suppresses settings
+  mClock ignores; recommends an `osd_mclock_profile` under mClock.
+- `osd_scrub_sleep` seconds-typed (floats); `osd_max_scrubs` capped
+  at 2 (3 with `--aggressive-scrubs`).
+- `osd_scrub_interval_randomize_ratio = 0.5` emitted to avoid
+  synchronized scrub storms.
+- Replication / EC factor honored via `--replica-size` / `--ec-ratio`.
+- Scrub-time estimate uses `SCRUB_BUDGET_PERCENT` (default 10%).
 - Device baselines refreshed and overridable via `--device-profile`.
-- `--avg-pg-size-gb` / `PG_SIZE_GB` to override the 4 GB guess; banner
-  shown on default.
-- Still prompt-driven; Phase 1 adds `--from-cluster` ingestion.
+- Prompt mode preserved as the default for off-cluster modeling.
 - Still no `--apply` / `--diff` / `--rollback`; Phase 5 adds them.
 
 ---
@@ -197,7 +206,7 @@ documented.
 Replace prompts with `ceph` introspection. The script becomes a
 read-only consumer of the cluster's own truth.
 
-### `[ ]` 1.1 `--from-cluster` flag
+### `[x]` 1.1 `--from-cluster` flag
 **Why.** Make cluster ingestion explicit so the prompt-driven path
 remains available for off-cluster modeling.
 **What.** Add `--from-cluster`. When set, skip prompts and shell out to
@@ -207,7 +216,7 @@ either is missing.
 **Accept.** `scrubadub.sh --from-cluster` runs without prompts on a mon
 node; sensible error messages off-cluster.
 
-### `[ ]` 1.2 Read OSD inventory
+### `[x]` 1.2 Read OSD inventory
 **Why.** Replaces the HDD/SSD/NVMe count prompts and gives us OSDs-per-host
 for the Phase 0.3 / Phase 3.4 concurrency guard.
 **What.** Parse `ceph osd tree --format json` for device-class counts
@@ -215,7 +224,7 @@ and the OSD-to-host map.
 **Accept.** With `--from-cluster`, counts match `ceph osd count-metadata
 device_class`.
 
-### `[ ]` 1.3 Read PG distribution and variance
+### `[x]` 1.3 Read PG distribution and variance
 **Why.** Replaces the per-class PG count prompts. Variance matters: an
 even distribution makes "max PGs/OSD" pessimistic; an uneven one
 warrants a rebalance recommendation.
@@ -224,7 +233,7 @@ compute mean and stddev per device class. Warn when stddev/mean > 0.15.
 **Accept.** PG-per-OSD numbers match `ceph osd df`; stddev warning fires
 on intentionally-unbalanced test fixture.
 
-### `[ ]` 1.4 Read pool details for real PG sizes
+### `[x]` 1.4 Read pool details for real PG sizes
 **Why.** Replaces the `AVG_PG_SIZE=4 GB` guess with a real number,
 per pool.
 **What.** `ceph osd pool ls detail --format json` +
@@ -235,14 +244,14 @@ device-class-weighted cluster average.
 5% on a test fixture; per-pool PG sizes are shown in the analysis
 section.
 
-### `[ ]` 1.5 Read current scrub config for diff
+### `[x]` 1.5 Read current scrub config for diff
 **Why.** Enables current → proposed presentation, the foundation for the
 Phase 5 apply/diff workflow.
 **What.** Parse `ceph config dump --format json` for every scrub
 parameter we touch. Render output as `param: current=X → proposed=Y`.
 **Accept.** Current values match `ceph config get osd <param>`.
 
-### `[ ]` 1.6 Read Ceph version + scheduler
+### `[x]` 1.6 Read Ceph version + scheduler
 **Why.** Wires live detection into the Phase 0.6 banner and Phase 0.7
 suppression.
 **What.** Run `ceph version` and `ceph config get osd osd_op_queue`.
@@ -251,7 +260,7 @@ the emitters.
 **Accept.** Banner renders the correct scheduler; mClock suppression
 applies automatically without user input.
 
-### `[ ]` 1.7 Read scrub backlog as ground truth
+### `[x]` 1.7 Read scrub backlog as ground truth
 **Why.** Best signal for "are we falling behind?" — better than the
 estimated time the tool prints today.
 **What.** Parse `ceph pg dump pgs_brief --format json` for
@@ -260,13 +269,13 @@ of PG ages and highlight PGs past their interval. Feeds Phase 6.1.
 **Accept.** Backlog counts match `ceph health detail` for any
 `PG_NOT_(DEEP_)SCRUBBED_IN_TIME` warnings active on the cluster.
 
-### `[ ]` 1.8 Backwards-compatible prompt mode
+### `[x]` 1.8 Backwards-compatible prompt mode
 **Why.** What-if modeling and off-cluster use shouldn't break.
 **What.** Default behavior without `--from-cluster` is the existing
 prompt flow.
 **Accept.** No regressions in the v1 interactive UX.
 
-### `[ ]` 1.9 Refuse to run on non-mon nodes by default
+### `[x]` 1.9 Refuse to run on non-mon nodes by default
 **Why.** Some `ceph` commands are slow or unauthorized off the mon;
 running on an OSD host is a footgun.
 **What.** Detect mon-ness via presence of `/var/lib/ceph/mon` or

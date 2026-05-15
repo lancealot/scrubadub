@@ -17,17 +17,54 @@ Several items below describe v1 behavior that is being corrected in
 [ROADMAP.md Phase 0](ROADMAP.md#phase-0--correctness-fixes). Where the
 caveat affects you operationally, it's called out inline.
 
+## Two modes: prompt vs cluster-ingested
+
+scrubadub runs in either of two modes:
+
+- **Prompt mode** (default). You type in OSD counts, PG counts, and
+  pick a workload type. Useful for off-cluster modeling and for
+  exploring "what would scrubadub recommend if...?" scenarios.
+- **Cluster-ingested mode** (`--from-cluster`, Phase 1). Run on a Ceph
+  monitor node; scrubadub reads OSD inventory, PG distribution, pool
+  sizes, current scrub config, the active scheduler, and the scrub
+  backlog directly from the `ceph` CLI. Requires `ceph` and `jq` on
+  PATH. By default refuses to run if it doesn't detect a mon node;
+  pass `--force` to override.
+
+Workload type isn't auto-detectable. In cluster mode, either pass
+`--workload {read|write|mixed|archive}` or let scrubadub prompt you
+for it.
+
+### Cluster-mode output
+
+In `--from-cluster` mode scrubadub adds two sections to the report:
+
+1. **Scrub Backlog** — total PG count and how many are past their
+   scrub / deep-scrub interval (the same signal `ceph health detail`
+   raises as `PG_NOT_(DEEP_)SCRUBBED_IN_TIME`).
+2. **Proposed Changes** — each recommended parameter rendered as
+   `current → proposed`, highlighting only what would change. This
+   is the foundation for the Phase 5 apply/diff/rollback workflow.
+
 ## Command-line flags
 
 ```
---avg-pg-size-gb N      Average PG size in GB (default: 4, a guess).
+--from-cluster          Read OSD inventory, PG distribution, pool
+                        sizes, current config, scheduler, and scrub
+                        backlog from 'ceph' (run on a mon node).
+--force                 Allow --from-cluster on a non-mon host.
+--workload {read|write|mixed|archive}
+                        Declare workload up front; skips the prompt.
+--avg-pg-size-gb N      Average PG size in GB. Default: 4 (a guess)
+                        in prompt mode; computed from 'ceph df detail'
+                        under --from-cluster.
 --replica-size N        Treat pools as N-way replicated (default: 3).
 --ec-ratio k+m          Treat pools as erasure-coded k+m (e.g. 8+3).
                         Mutually exclusive with --replica-size.
 --scheduler {wpq|mclock}
-                        Active OSD op scheduler. Prompted if omitted.
-                        Under mClock, scrubadub omits the knobs the
-                        scheduler ignores and recommends a profile.
+                        Active OSD op scheduler. Auto-detected under
+                        --from-cluster; prompted otherwise. mClock
+                        suppresses the knobs it ignores.
 --hyperconverged        Other workloads share the OSD hosts. Allows
                         more aggressive osd_scrub_load_threshold under
                         WPQ.
@@ -37,8 +74,9 @@ caveat affects you operationally, it's called out inline.
 -h, --help              Show help.
 ```
 
-Environment variables: `PG_SIZE_GB`, `SCRUB_BUDGET_PERCENT`, and any of
-the device constants from `--device-profile`.
+Environment variables: `PG_SIZE_GB`, `SCRUB_BUDGET_PERCENT`,
+`CEPH_FIXTURE_DIR` (testing — replaces live `ceph` calls with fixture
+JSON files), and any of the device constants from `--device-profile`.
 
 ## Prerequisites
 Before running scrubadub, gather the following information from your Ceph cluster:
