@@ -55,6 +55,13 @@ In `--from-cluster` mode scrubadub adds two sections to the report:
 --force                 Allow --from-cluster on a non-mon host.
 --workload {read|write|mixed|archive}
                         Declare workload up front; skips the prompt.
+--nic-gbps N            Per-host NIC speed in Gbps. Caps the scrub
+                        throughput estimate at hosts × NIC. Auto-
+                        detected via 'ethtool' under --from-cluster.
+--hosts N               Host count (prompt mode only; auto-detected
+                        under --from-cluster).
+--osds-per-host N       Max OSDs per host (prompt mode only); enables
+                        the per-host concurrency warning.
 --avg-pg-size-gb N      Average PG size in GB. Default: 4 (a guess)
                         in prompt mode; computed from 'ceph df detail'
                         under --from-cluster.
@@ -263,6 +270,60 @@ References:
 - [Ceph mClock Config Reference](https://docs.ceph.com/en/reef/rados/configuration/mclock-config-ref/)
 - [Clyso — how to disable mClock](https://www.clyso.com/blog/ceph-how-do-disable-mclock-scheduler/)
 - [Ceph mClock vs WPQ comparison study](https://docs.ceph.com/en/reef/dev/osd_internals/mclock_wpq_cmp_study/)
+
+## Performance model: what scrubadub estimates
+
+Phase 3 of the roadmap rebuilt the scrub-time math to be honest. The
+analysis section in the report shows:
+
+- **Raw disk throughput** — sum of per-OSD MB/s from baselines (or
+  `--device-profile` overrides). On its own this is the wrong upper
+  bound for scrub: networks are usually slower than the disk pool.
+- **Network ceiling** — `hosts × per-host NIC × 125 MB/s/Gbps`.
+  Auto-detected via `ethtool` under `--from-cluster`; in prompt mode,
+  pass `--hosts N --nic-gbps N`. Skipped (and clearly labelled "not
+  modeled") when the inputs aren't available.
+- **Binding ceiling** — `min(disk, network)`. Whichever is lower is
+  the real upper bound; scrubadub labels it `disk-bound` or
+  `network-bound`.
+- **Scrub budget** — `SCRUB_BUDGET_PERCENT` (default 10%) of the
+  binding ceiling. Override via env var. Real scrubs don't get 100%
+  of cluster bandwidth — 10–15% is realistic.
+- **Shallow vs deep estimates** — shallow scrub reads metadata, deep
+  scrub reads object data. scrubadub prints both and compares each
+  against its own configured interval (`osd_scrub_max_interval` for
+  shallow, `osd_deep_scrub_interval` for deep). Shallow is typically
+  seek-bound, not bandwidth-bound; treat its estimate as
+  order-of-magnitude.
+
+### IOPS source
+
+In `--from-cluster` mode, scrubadub reads
+`osd_mclock_max_capacity_iops_hdd` and `..._ssd` from `ceph config
+dump`. When non-zero, those measured values replace the hardcoded
+device baselines in the analysis section (the script's defaults are
+labelled `source: default`; substitutions are labelled `source:
+mClock benchmark`).
+
+If the measured values look wildly low, the mClock benchmark advisory
+fires (see the previous section) and the script keeps using whichever
+value is in `ceph config` — re-run the benchmark before relying on the
+estimate.
+
+### Per-host scrub concurrency
+
+scrubadub computes `proposed_osd_max_scrubs × max(OSDs_per_host)` and
+prints the result as `N simultaneous scrubs per host`. When that
+product exceeds 8, scrubadub warns: many hosts can absorb a few
+parallel scrubs but starve clients past that point.
+
+In `--from-cluster` mode the OSDs-per-host count comes from
+`ceph osd tree`. In prompt mode, pass `--osds-per-host N` to enable
+the warning.
+
+If you need to tighten further, Squid+ has `osd_scrub_max_concurrent_per_host`;
+on older releases the practical equivalent is `osd_max_scrubs=1` plus
+a tight `osd_scrub_begin_hour`/`osd_scrub_end_hour` window.
 
 ## Best Practices
 

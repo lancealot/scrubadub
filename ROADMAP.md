@@ -33,9 +33,26 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1.3)
+## Current baseline (v1.4)
 
-After Phase 0, Phase 1, and Phase 2:
+After Phase 0, Phase 1, Phase 2, and Phase 3:
+
+Honest performance model (Phase 3):
+- Network ceiling: scrub-time math now uses
+  `min(disk_total, hosts × per-host NIC × 125 MB/s)` × `SCRUB_BUDGET_PERCENT`.
+  Auto-detected via `ip` + `ethtool` under `--from-cluster`; in prompt
+  mode, pass `--hosts N --nic-gbps N`.
+- mClock self-benchmark: when `osd_mclock_max_capacity_iops_{hdd,ssd}`
+  are present in `ceph config dump`, scrubadub uses those measured
+  values in place of the hardcoded device IOPS. The analysis section
+  labels each row's IOPS as `source: default` or `source: mClock benchmark`.
+- Shallow vs deep scrub estimates are reported separately, each
+  compared against its own configured interval (`osd_scrub_max_interval`
+  vs `osd_deep_scrub_interval`).
+- Per-host scrub concurrency: scrubadub computes
+  `proposed_max_scrubs × max(OSDs_per_host)` and warns when the
+  product exceeds 8 (the threshold past which most hosts can't keep
+  serving clients comfortably).
 
 Scheduler-aware output (Phase 2):
 - `calculate_scrub_settings` is now a dispatcher; each scheduler has
@@ -343,7 +360,7 @@ scrubadub follows whichever scheduler is active.
 
 ## Phase 3 — Honest performance model
 
-### `[ ]` 3.1 Network ceiling
+### `[x]` 3.1 Network ceiling
 **Why.** Sum-of-disk-throughput is the wrong upper bound; the NIC is
 usually the real one.
 **What.** Detect host NIC speed via `ip -j link show` (parse
@@ -352,7 +369,7 @@ usually the real one.
 `min(sum_per_OSD, hosts × per_host_NIC_GB/s) × SCRUB_BUDGET_FRACTION`.
 **Accept.** Estimates respect the NIC ceiling on a 1 GbE test fixture.
 
-### `[ ]` 3.2 Use mClock's self-benchmark when available
+### `[x]` 3.2 Use mClock's self-benchmark when available
 **Why.** The cluster has already measured itself; trust its numbers
 over the script's hardcoded ones.
 **What.** Pull `osd_mclock_max_capacity_iops_hdd` and
@@ -362,14 +379,14 @@ present and non-zero, use them in place of the device constants.
 shows them and uses them; hardcoded fallback only when they're
 missing.
 
-### `[ ]` 3.3 Distinguish shallow vs deep scrub estimates
+### `[x]` 3.3 Distinguish shallow vs deep scrub estimates
 **Why.** Shallow scrub is metadata-only; deep scrub reads object
 data. Conflating them hides the real cost.
 **What.** Print two estimates (shallow and deep) and align each to
 its own interval (`osd_scrub_max_interval` vs `osd_deep_scrub_interval`).
 **Accept.** Both estimates appear in the analysis section.
 
-### `[ ]` 3.4 Per-host concurrency cost warning
+### `[x]` 3.4 Per-host concurrency cost warning
 **Why.** Counterpart to Phase 0.3 — call it out even when the script
 itself isn't raising `osd_max_scrubs`.
 **What.** Warn when `osd_max_scrubs × max(OSDs_per_host) > 8`. Suggest

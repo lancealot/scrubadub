@@ -52,6 +52,14 @@ FROM_CLUSTER=0
 FORCE_NON_MON=0
 WORKLOAD_TYPE=""   # 1/2/3/4; if set via --workload, skips the prompt
 
+# Phase 3: honest performance model.
+NIC_GBPS=""          # --nic-gbps; per-host NIC speed in Gbps
+HOST_COUNT=""        # --hosts (prompt mode); auto-detected in --from-cluster
+OSDS_PER_HOST=""     # --osds-per-host (prompt mode); auto in --from-cluster
+NIC_MBPS=0           # computed: NIC_GBPS * 125
+NIC_SOURCE=""        # "--nic-gbps", "ethtool", or empty
+NETWORK_CEILING=0    # computed: HOST_COUNT * NIC_MBPS, MB/s; 0 means unused
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -85,6 +93,15 @@ Cluster-ingested mode (Phase 1):
                           like a monitor. Footgun; off by default.
   --workload {read|write|mixed|archive}
                           Skip the workload prompt by declaring up front.
+
+Performance model (Phase 3):
+  --nic-gbps N            Per-host NIC speed in Gbps. Caps the scrub
+                          throughput estimate at hosts × NIC_GBPS.
+                          Auto-detected via 'ethtool' under --from-cluster.
+  --hosts N               Host count for the network-ceiling computation
+                          in prompt mode. Auto-detected under --from-cluster.
+  --osds-per-host N       Max OSDs per host, for the per-host scrub
+                          concurrency warning in prompt mode.
 
 Tuning options:
   --avg-pg-size-gb N      Average PG size in GB (default: 4 in prompt mode,
@@ -192,6 +209,28 @@ parse_args() {
                     archive) WORKLOAD_TYPE=4 ;;
                     *) print_error "--workload must be read, write, mixed, or archive"; exit 2 ;;
                 esac
+                shift 2 ;;
+            --nic-gbps)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    print_error "--nic-gbps must be a positive number"; exit 2
+                fi
+                NIC_GBPS="$2"
+                NIC_SOURCE="--nic-gbps"
+                shift 2 ;;
+            --hosts)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    print_error "--hosts must be a positive integer"; exit 2
+                fi
+                HOST_COUNT="$2"
+                shift 2 ;;
+            --osds-per-host)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    print_error "--osds-per-host must be a positive integer"; exit 2
+                fi
+                OSDS_PER_HOST="$2"
                 shift 2 ;;
             -h|--help)
                 usage
@@ -521,7 +560,7 @@ check_ceph_environment() {
     exit 3
 }
 
-# Phase 1.2: device-class OSD counts + max OSDs/host.
+# Phase 1.2: device-class OSD counts + max OSDs/host + host count.
 osds_per_host_max=0
 ingest_osd_inventory() {
     local tree
@@ -531,11 +570,56 @@ ingest_osd_inventory() {
     ssd_count=$(echo "$tree" | jq '[.nodes[] | select(.type=="osd" and .device_class=="ssd")] | length')
     nvme_count=$(echo "$tree" | jq '[.nodes[] | select(.type=="osd" and .device_class=="nvme")] | length')
 
-    # max OSDs per host (for the Phase 0.3 per-host concurrency warning).
+    # max OSDs per host (Phase 0.3 / 3.4 per-host concurrency).
     osds_per_host_max=$(echo "$tree" | jq '
         [.nodes[] | select(.type=="host") | .children | length] | max // 0')
 
-    print_notice "OSD inventory: HDD=$hdd_count SSD=$ssd_count NVMe=$nvme_count; max OSDs/host=$osds_per_host_max"
+    # Host count (Phase 3.1 network ceiling).
+    if [ -z "$HOST_COUNT" ]; then
+        HOST_COUNT=$(echo "$tree" | jq '[.nodes[] | select(.type=="host")] | length')
+    fi
+
+    print_notice "OSD inventory: HDD=$hdd_count SSD=$ssd_count NVMe=$nvme_count; hosts=$HOST_COUNT; max OSDs/host=$osds_per_host_max"
+}
+
+# Phase 3.1: detect per-host NIC speed via ethtool. Returns Mbps via stdout,
+# or 0 if no usable interface found.
+detect_nic_speed_mbps() {
+    command -v ip >/dev/null 2>&1 || { echo 0; return; }
+    command -v ethtool >/dev/null 2>&1 || { echo 0; return; }
+    local max_speed=0 iface speed
+    # ip -j gives JSON. Pick UP, non-loopback, non-virtual interfaces.
+    for iface in $(ip -j link show 2>/dev/null \
+                    | jq -r '.[] | select(.operstate=="UP" and .ifname != "lo") | .ifname' 2>/dev/null); do
+        speed=$(ethtool "$iface" 2>/dev/null | awk '/^[[:space:]]*Speed:/ { print $2 }' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$speed" ] && [ "$speed" -gt "$max_speed" ]; then
+            max_speed=$speed
+        fi
+    done
+    echo "$max_speed"
+}
+
+# Phase 3.1: derive the network ceiling from --nic-gbps (or ethtool in
+# from-cluster mode) and HOST_COUNT. Sets the NIC_MBPS / NIC_SOURCE /
+# NETWORK_CEILING globals. Leaves NETWORK_CEILING=0 when there's not
+# enough information (prompt mode without --hosts and --nic-gbps).
+compute_network_ceiling() {
+    if [ -n "$NIC_GBPS" ]; then
+        NIC_SOURCE="${NIC_SOURCE:---nic-gbps}"
+    elif [ "$FROM_CLUSTER" -eq 1 ]; then
+        local detected
+        detected=$(detect_nic_speed_mbps)
+        if [ "$detected" -gt 0 ]; then
+            # Convert Mbps -> Gbps for display; keep Mbps for math.
+            NIC_GBPS=$(awk "BEGIN { printf \"%g\", $detected / 1000 }")
+            NIC_SOURCE="ethtool"
+        fi
+    fi
+    if [ -n "$NIC_GBPS" ] && [ -n "$HOST_COUNT" ] && [ "$HOST_COUNT" -gt 0 ]; then
+        # 1 Gbps = 125 MB/s (1000/8). awk handles fractional NIC speeds.
+        NIC_MBPS=$(awk "BEGIN { printf \"%d\", $NIC_GBPS * 125 }")
+        NETWORK_CEILING=$((HOST_COUNT * NIC_MBPS))
+    fi
 }
 
 # Phase 1.3: per-device-class PG counts + stddev/mean warning.
@@ -901,6 +985,30 @@ else
     print_success "WPQ is active. All scrub knobs (sleep, load_threshold, intervals, ...) honored."
 fi
 
+# Phase 3.1: derive network ceiling now that all inputs are in.
+compute_network_ceiling
+
+# Phase 3.2: substitute mClock-measured IOPS where the cluster has them.
+HDD_IOPS_SOURCE="default"
+SSD_IOPS_SOURCE="default"
+NVME_IOPS_SOURCE="default"
+if [ "$FROM_CLUSTER" -eq 1 ]; then
+    if [ -n "${current_osd_mclock_max_capacity_iops_hdd:-}" ]; then
+        m_hdd=${current_osd_mclock_max_capacity_iops_hdd%.*}
+        if [ -n "$m_hdd" ] && [ "$m_hdd" -gt 0 ] 2>/dev/null; then
+            HDD_IOPS=$m_hdd; HDD_IOPS_SOURCE="mClock benchmark"
+        fi
+    fi
+    if [ -n "${current_osd_mclock_max_capacity_iops_ssd:-}" ]; then
+        m_ssd=${current_osd_mclock_max_capacity_iops_ssd%.*}
+        if [ -n "$m_ssd" ] && [ "$m_ssd" -gt 0 ] 2>/dev/null; then
+            SSD_IOPS=$m_ssd; SSD_IOPS_SOURCE="mClock benchmark"
+            # mClock doesn't separate ssd/nvme; use the same number for both.
+            NVME_IOPS=$m_ssd; NVME_IOPS_SOURCE="mClock benchmark (ssd)"
+        fi
+    fi
+fi
+
 # Analysis
 print_header "Analysis Results"
 echo "Device Class Distribution and Performance"
@@ -916,7 +1024,7 @@ if [ "$hdd_count" -gt 0 ]; then
     echo "HDD OSDs: $hdd_count"
     echo "  - PGs: $hdd_pg_count (avg $(calculate_pg_per_osd "$hdd_pg_count" "$hdd_count") PGs/OSD)"
     echo "  - Raw throughput: $hdd_tp MB/s (${HDD_THROUGHPUT} MB/s/OSD)"
-    echo "  - IOPS: $hdd_io"
+    echo "  - IOPS: $hdd_io (${HDD_IOPS}/OSD, source: $HDD_IOPS_SOURCE)"
 fi
 if [ "$ssd_count" -gt 0 ]; then
     read -r ssd_tp ssd_io <<< "$(calculate_device_performance "$ssd_count" "$SSD_THROUGHPUT" "$SSD_IOPS")"
@@ -925,7 +1033,7 @@ if [ "$ssd_count" -gt 0 ]; then
     echo "SSD OSDs: $ssd_count"
     echo "  - PGs: $ssd_pg_count (avg $(calculate_pg_per_osd "$ssd_pg_count" "$ssd_count") PGs/OSD)"
     echo "  - Raw throughput: $ssd_tp MB/s (${SSD_THROUGHPUT} MB/s/OSD)"
-    echo "  - IOPS: $ssd_io"
+    echo "  - IOPS: $ssd_io (${SSD_IOPS}/OSD, source: $SSD_IOPS_SOURCE)"
 fi
 if [ "$nvme_count" -gt 0 ]; then
     read -r nvme_tp nvme_io <<< "$(calculate_device_performance "$nvme_count" "$NVME_THROUGHPUT" "$NVME_IOPS")"
@@ -934,23 +1042,46 @@ if [ "$nvme_count" -gt 0 ]; then
     echo "NVMe OSDs: $nvme_count"
     echo "  - PGs: $nvme_pg_count (avg $(calculate_pg_per_osd "$nvme_pg_count" "$nvme_count") PGs/OSD)"
     echo "  - Raw throughput: $nvme_tp MB/s (${NVME_THROUGHPUT} MB/s/OSD)"
-    echo "  - IOPS: $nvme_io"
+    echo "  - IOPS: $nvme_io (${NVME_IOPS}/OSD, source: $NVME_IOPS_SOURCE)"
 fi
 
 echo
 echo "Cluster Totals"
-echo "  - Raw cluster throughput: $total_throughput MB/s (sum of per-OSD; ignores"
-echo "    network/CPU ceilings — Phase 3.1 will model these)"
-scrub_budget_mbps=$((total_throughput * SCRUB_BUDGET_PERCENT / 100))
-echo "  - Scrub budget: ${SCRUB_BUDGET_PERCENT}% of raw → ${scrub_budget_mbps} MB/s"
-echo "  - IOPS estimate: $total_iops"
-echo "  - Data factor: $DATA_FACTOR_SOURCE"
-echo "  - Avg PG size:  $AVG_PG_SIZE GB ($AVG_PG_SIZE_SOURCE)"
+echo "  - Raw disk throughput: $total_throughput MB/s (sum of per-OSD)"
+
+# Phase 3.1: pick effective ceiling = min(disk_total, network_total).
+effective_ceiling=$total_throughput
+ceiling_source="disk"
+if [ "$NETWORK_CEILING" -gt 0 ]; then
+    echo "  - Network ceiling:     $NETWORK_CEILING MB/s ($HOST_COUNT hosts × ${NIC_GBPS} Gbps, source: $NIC_SOURCE)"
+    if [ "$NETWORK_CEILING" -lt "$total_throughput" ]; then
+        effective_ceiling=$NETWORK_CEILING
+        ceiling_source="network"
+    fi
+    echo "  - Binding ceiling:     $effective_ceiling MB/s ($ceiling_source-bound)"
+else
+    if [ "$FROM_CLUSTER" -eq 1 ]; then
+        echo "  - Network ceiling:     not modeled (ethtool not available; pass --nic-gbps to override)"
+    else
+        echo "  - Network ceiling:     not modeled (pass --hosts and --nic-gbps in prompt mode)"
+    fi
+fi
+scrub_budget_mbps=$((effective_ceiling * SCRUB_BUDGET_PERCENT / 100))
+echo "  - Scrub budget:        ${SCRUB_BUDGET_PERCENT}% of binding → ${scrub_budget_mbps} MB/s"
+echo "  - IOPS estimate:       $total_iops"
+echo "  - Data factor:         $DATA_FACTOR_SOURCE"
+echo "  - Avg PG size:         $AVG_PG_SIZE GB ($AVG_PG_SIZE_SOURCE)"
 
 total_pgs=$((hdd_pg_count + ssd_pg_count + nvme_pg_count))
-estimated_scrub_time=$(calculate_scrub_time "$total_pgs" "$total_throughput")
+estimated_scrub_time=$(calculate_scrub_time "$total_pgs" "$effective_ceiling")
 est_days=$((estimated_scrub_time / 24))
-echo "  - Estimated full deep-scrub time: ${estimated_scrub_time} hours (~${est_days} days)"
+
+# Phase 3.3: shallow estimate. Shallow scrub reads object metadata and
+# is typically seek-bound, not bandwidth-bound — order-of-magnitude only.
+shallow_scrub_time=$((estimated_scrub_time / 20))   # ~5% of deep
+[ "$shallow_scrub_time" -lt 1 ] && shallow_scrub_time=1
+echo "  - Shallow scrub time:  ~${shallow_scrub_time} hours (rough; shallow is seek-bound)"
+echo "  - Deep scrub time:     ~${estimated_scrub_time} hours (~${est_days} days)"
 
 # Max PGs/OSD across classes
 max_pg_per_osd=0
@@ -995,19 +1126,49 @@ for setting in "${proposed_settings[@]}"; do
 done
 
 print_header "Performance Impact Analysis"
-echo "Scrub Schedule Analysis:"
-if [ "$estimated_scrub_time" -gt 168 ]; then
-    print_warning "Estimated deep-scrub time ($estimated_scrub_time h / ${est_days} d) exceeds 7 days."
-    echo "  Recommendations to address this:"
-    echo "    1. Verify --avg-pg-size-gb matches reality (Phase 1.4 will compute it)."
+
+# Phase 3.3: compare each estimate to its own configured interval.
+# Defaults: max_interval=7d (168h), deep_interval=7d. In cluster mode we
+# read whatever is actually configured.
+deep_iv_h=$(( (${current_osd_deep_scrub_interval:-604800}) / 3600 ))
+shallow_iv_h=$(( (${current_osd_scrub_max_interval:-604800}) / 3600 ))
+
+echo "Deep scrub:"
+if [ "$estimated_scrub_time" -gt "$deep_iv_h" ]; then
+    print_warning "Estimated deep-scrub time (${estimated_scrub_time} h / ${est_days} d) exceeds your"
+    print_warning "  current osd_deep_scrub_interval (${deep_iv_h} h). Backlog will grow."
+    echo "  Recommendations:"
+    echo "    1. Verify --avg-pg-size-gb matches reality (Phase 1.4 computes it under --from-cluster)."
     echo "    2. Verify --replica-size / --ec-ratio matches your largest pool's overhead."
     echo "    3. Consider --aggressive-scrubs after verifying per-host headroom."
     echo "    4. Review PG distribution; rebalance if uneven."
-elif [ "$estimated_scrub_time" -gt 72 ]; then
-    print_notice "Estimated deep-scrub time ($estimated_scrub_time h) exceeds 3 days."
-    echo "  The settings above have been adjusted to improve completion time."
+elif [ "$estimated_scrub_time" -gt $((deep_iv_h * 60 / 100)) ]; then
+    print_notice "Estimated deep-scrub time (${estimated_scrub_time} h) is >60% of the deep-scrub interval (${deep_iv_h} h)."
+    echo "  Tight margin; rerun if cluster grows."
 else
-    print_success "Estimated deep-scrub time ($estimated_scrub_time h) is within acceptable range."
+    print_success "Estimated deep-scrub time (${estimated_scrub_time} h) fits within deep-scrub interval (${deep_iv_h} h)."
+fi
+
+echo "Shallow scrub:"
+if [ "$shallow_scrub_time" -gt "$shallow_iv_h" ]; then
+    print_warning "Estimated shallow-scrub time (${shallow_scrub_time} h) exceeds osd_scrub_max_interval (${shallow_iv_h} h)."
+else
+    print_success "Estimated shallow-scrub time (${shallow_scrub_time} h) fits within osd_scrub_max_interval (${shallow_iv_h} h)."
+fi
+
+# Phase 3.4: per-host scrub concurrency warning.
+# Use osds_per_host_max from --from-cluster, else --osds-per-host override.
+ph_max="${OSDS_PER_HOST:-${osds_per_host_max:-0}}"
+proposed_max_scrubs=$(printf '%s\n' "${proposed_settings[@]}" | awk -F' = ' '/^osd_max_scrubs/ { print $2 }')
+if [ -n "$proposed_max_scrubs" ] && [ "$ph_max" -gt 0 ]; then
+    concurrent=$((proposed_max_scrubs * ph_max))
+    echo "Per-host scrub concurrency: ${proposed_max_scrubs} × ${ph_max} OSDs/host = ${concurrent} simultaneous scrubs."
+    if [ "$concurrent" -gt 8 ]; then
+        print_warning "${concurrent} simultaneous scrubs per host is high. On busy hosts this can"
+        print_warning "  starve client I/O. Consider lowering osd_max_scrubs, or using a per-host"
+        print_warning "  scrub cap (osd_scrub_max_concurrent_per_host on Squid+; rolling restart"
+        print_warning "  with osd_max_scrubs=1 + scrub-window enforcement on older releases)."
+    fi
 fi
 
 echo

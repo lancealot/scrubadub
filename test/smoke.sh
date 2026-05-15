@@ -109,5 +109,40 @@ check     "mclock recommends profile"       "$out" "osd_mclock_profile balanced"
 check_not "mclock recommendation omits sleep" "$out" "ceph config set osd osd_scrub_sleep"
 
 echo
+echo "Test 7: Phase 3 — network ceiling"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 2>&1)
+check     "1 GbE × 3 hosts → 375 MB/s ceiling"  "$out" "Network ceiling:     375 MB/s"
+check     "binding ceiling shows network-bound" "$out" "network-bound"
+check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~336 hours"
+
+# No --nic-gbps in prompt mode → no network ceiling
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
+check     "prompt mode w/o flags skips network" "$out" "Network ceiling:     not modeled"
+
+echo
+echo "Test 8: Phase 3.2 — mClock IOPS substitution"
+out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "mClock HDD IOPS used"   "$out" "12/OSD, source: mClock benchmark"
+check     "mClock SSD IOPS used"   "$out" "1000/OSD, source: mClock benchmark"
+
+echo
+echo "Test 9: Phase 3.3 — shallow vs deep estimates"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "shallow scrub estimate shown"  "$out" "Shallow scrub time:"
+check     "deep scrub estimate shown"     "$out" "Deep scrub time:"
+check     "interval comparison shown"     "$out" "fits within deep-scrub interval"
+
+echo
+echo "Test 10: Phase 3.4 — per-host concurrency warning"
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq --osds-per-host 16 --aggressive-scrubs 2>&1)
+check     "concurrency line shown"        "$out" "16 simultaneous scrubs"
+check     "concurrency warning > 8 fires" "$out" "high. On busy hosts"
+
+# At 8 (boundary) the warning should NOT fire.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 --aggressive-scrubs 2>&1)
+check     "concurrency line shown at 8"   "$out" "8 simultaneous scrubs"
+check_not "no warning at exactly 8"       "$out" "On busy hosts"
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
