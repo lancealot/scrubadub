@@ -159,8 +159,8 @@ echo "Test 12: Phase 4.2 — per-pool overrides and noscrub warnings"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
 check     "per-pool section appears"                         "$out" "Per-pool overrides"
 check     "noscrub flag warning fires"                       "$out" "Pool paused-bulk: hashpspool,noscrub,nodeep-scrub"
-check     "unset command emitted for noscrub"                "$out" "ceph osd pool unset paused-bulk noscrub"
-check     "unset command emitted for nodeep-scrub"           "$out" "ceph osd pool unset paused-bulk nodeep-scrub"
+check     "documented syntax used for clearing noscrub"      "$out" "ceph osd pool set paused-bulk noscrub false"
+check     "documented syntax used for nodeep-scrub"          "$out" "ceph osd pool set paused-bulk nodeep-scrub false"
 check     "hot pool deep_scrub_interval override"            "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
 check     "apply line uses pool set syntax"                  "$out" "ceph osd pool set rgw.buckets.index deep_scrub_interval 259200"
 

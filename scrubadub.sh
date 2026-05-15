@@ -1222,8 +1222,8 @@ if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
     print_header "Per-pool overrides"
     for warning in "${pool_warnings[@]}"; do
         print_warning "Pool $warning"
-        echo "    To re-enable: ceph osd pool unset ${warning%%:*} noscrub"
-        echo "                  ceph osd pool unset ${warning%%:*} nodeep-scrub"
+        echo "    To re-enable: ceph osd pool set ${warning%%:*} noscrub false"
+        echo "                  ceph osd pool set ${warning%%:*} nodeep-scrub false"
     done
     for override in "${pool_overrides[@]}"; do
         pname="${override%%#*}"
