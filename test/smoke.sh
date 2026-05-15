@@ -169,5 +169,32 @@ out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
 check_not "prompt mode skips per-pool section"               "$out" "Per-pool overrides"
 
 echo
+echo "Test 13: --scrub-budget-percent flag"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --scrub-budget-percent 25 2>&1)
+check     "25% override applied to budget math"  "$out" "25% of binding → 825 MB/s"
+check     "budget source labelled as flag"       "$out" "source: --scrub-budget-percent"
+
+out=$(SCRUB_BUDGET_PERCENT=42 CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "env var still works"                  "$out" "42% of binding → 1386 MB/s"
+check     "env source labelled correctly"        "$out" "source: SCRUB_BUDGET_PERCENT env"
+
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "default source labelled correctly"    "$out" "10% of binding → 330 MB/s (source: default)"
+
+# Validation: out-of-range and non-integer values rejected.
+set +e
+out=$("$SB" --scrub-budget-percent 0 2>&1)
+set -e
+check     "rejects 0"                            "$out" "must be an integer 1-100"
+set +e
+out=$("$SB" --scrub-budget-percent 101 2>&1)
+set -e
+check     "rejects 101"                          "$out" "must be an integer 1-100"
+set +e
+out=$("$SB" --scrub-budget-percent 1.5 2>&1)
+set -e
+check     "rejects float"                        "$out" "must be an integer 1-100"
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

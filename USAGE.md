@@ -286,9 +286,25 @@ analysis section in the report shows:
 - **Binding ceiling** — `min(disk, network)`. Whichever is lower is
   the real upper bound; scrubadub labels it `disk-bound` or
   `network-bound`.
-- **Scrub budget** — `SCRUB_BUDGET_PERCENT` (default 10%) of the
-  binding ceiling. Override via env var. Real scrubs don't get 100%
-  of cluster bandwidth — 10–15% is realistic.
+- **Scrub budget** — share of the binding ceiling reserved for scrub.
+  Default 10%; tune via `--scrub-budget-percent N` (or the
+  `SCRUB_BUDGET_PERCENT` env var). Real scrubs don't get 100% of
+  cluster bandwidth, and the value should reflect how loaded the
+  cluster actually is:
+
+  | Cluster state    | Reasonable budget |
+  |------------------|------------------:|
+  | Heavy production load (steady client I/O near ceiling) | 5–8% |
+  | Normal mixed workload                                  | 10–15% (default) |
+  | Light load / off-hours                                 | 20–30% |
+  | Idle / backlog-recovery window                         | 40–50% |
+
+  scrubadub prints the value's source (`default`, `--scrub-budget-percent`,
+  or `SCRUB_BUDGET_PERCENT env`) in the analysis section so it's clear
+  which knob is in play. The value is **static** — scrubadub is a
+  one-shot tool, not a daemon. A separate dynamic-tuning daemon is the
+  right home for "auto-raise the budget when the cluster is idle";
+  that's intentionally out of scope here.
 - **Shallow vs deep estimates** — shallow scrub reads metadata, deep
   scrub reads object data. scrubadub prints both and compares each
   against its own configured interval (`osd_scrub_max_interval` for

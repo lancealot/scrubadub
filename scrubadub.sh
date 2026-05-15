@@ -33,7 +33,15 @@ AVG_PG_SIZE_SOURCE="default"
 
 # Scrub budget: scrub never gets 100% of cluster throughput. Realistic
 # share is ~10-15%. Phase 0.9.
-SCRUB_BUDGET_PERCENT=${SCRUB_BUDGET_PERCENT:-10}
+# Source is one of: "default", "SCRUB_BUDGET_PERCENT env", "--scrub-budget-percent".
+# A future dynamic-tuning daemon would replace this static value with
+# one derived from observed client load; out of scope for this project.
+if [ -n "${SCRUB_BUDGET_PERCENT:-}" ]; then
+    SCRUB_BUDGET_SOURCE="SCRUB_BUDGET_PERCENT env"
+else
+    SCRUB_BUDGET_PERCENT=10
+    SCRUB_BUDGET_SOURCE="default"
+fi
 
 # Replication / EC factor. Default to 3x replicated (most common).
 # Overridden by --replica-size or --ec-ratio.
@@ -118,6 +126,11 @@ Tuning options:
                           osd_scrub_load_threshold values under WPQ.
   --aggressive-scrubs     Permit osd_max_scrubs up to 3 (default cap: 2).
                           Read ROADMAP Phase 0.3 first.
+  --scrub-budget-percent N
+                          Integer 1-100. Share of the binding ceiling
+                          (min of disk/network) reserved for scrub.
+                          Default 10. Drop to 5 on busy clusters, raise
+                          to 20-30 on idle ones to catch up backlog.
   --device-profile FILE   Source KEY=VALUE overrides for device constants.
                           Keys: HDD_THROUGHPUT, HDD_IOPS, SSD_THROUGHPUT,
                           SSD_IOPS, NVME_THROUGHPUT, NVME_IOPS.
@@ -125,8 +138,7 @@ Tuning options:
 
 Environment variables:
   PG_SIZE_GB              Same as --avg-pg-size-gb.
-  SCRUB_BUDGET_PERCENT    Percent of cluster throughput available for
-                          scrub (default: 10).
+  SCRUB_BUDGET_PERCENT    Same as --scrub-budget-percent (default: 10).
   CEPH_FIXTURE_DIR        Replace live 'ceph' calls with fixture files in
                           the given directory. For testing.
   Plus any device constant from --device-profile.
@@ -217,6 +229,14 @@ parse_args() {
                 fi
                 NIC_GBPS="$2"
                 NIC_SOURCE="--nic-gbps"
+                shift 2 ;;
+            --scrub-budget-percent)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^[1-9][0-9]?$|^100$ ]]; then
+                    print_error "--scrub-budget-percent must be an integer 1-100"; exit 2
+                fi
+                SCRUB_BUDGET_PERCENT="$2"
+                SCRUB_BUDGET_SOURCE="--scrub-budget-percent"
                 shift 2 ;;
             --hosts)
                 require_value "$1" "${2:-}"
@@ -1136,7 +1156,7 @@ else
     fi
 fi
 scrub_budget_mbps=$((effective_ceiling * SCRUB_BUDGET_PERCENT / 100))
-echo "  - Scrub budget:        ${SCRUB_BUDGET_PERCENT}% of binding → ${scrub_budget_mbps} MB/s"
+echo "  - Scrub budget:        ${SCRUB_BUDGET_PERCENT}% of binding → ${scrub_budget_mbps} MB/s (source: $SCRUB_BUDGET_SOURCE)"
 echo "  - IOPS estimate:       $total_iops"
 echo "  - Data factor:         $DATA_FACTOR_SOURCE"
 echo "  - Avg PG size:         $AVG_PG_SIZE GB ($AVG_PG_SIZE_SOURCE)"
@@ -1290,8 +1310,11 @@ echo "  2. osd_scrub_load_threshold is normalized: loadavg / num_cpus. A 16-core
 echo "     host with threshold 0.5 pauses scrubs when loadavg > 8."
 echo "  3. osd_scrub_sleep is in SECONDS (float). Old scrubadub docs said"
 echo "     microseconds; that was wrong. See ROADMAP Phase 0.1."
-echo "  4. Scrub-time estimate assumes ${SCRUB_BUDGET_PERCENT}% of cluster throughput is"
-echo "     available to scrub. Override with SCRUB_BUDGET_PERCENT env var."
+echo "  4. Scrub-time estimate assumes ${SCRUB_BUDGET_PERCENT}% of the binding ceiling is"
+echo "     available to scrub (source: $SCRUB_BUDGET_SOURCE). Override with"
+echo "     --scrub-budget-percent N or the SCRUB_BUDGET_PERCENT env var. This is"
+echo "     a static value; on busy clusters lower it (5-8%), on idle clusters"
+echo "     raise it (20-30%) to catch up backlog."
 
 print_header "Additional Recommendations"
 echo "Before applying:"
