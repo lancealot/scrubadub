@@ -612,6 +612,7 @@ run_ceph() {
             "config dump --format json")           fixture="config_dump.json" ;;
             "config get osd osd_op_queue")         fixture="osd_op_queue.txt" ;;
             "pg dump pgs_brief --format json")     fixture="pg_dump_pgs_brief.json" ;;
+            "health detail --format json")         fixture="health_detail.json" ;;
             "version")                              fixture="version.txt" ;;
             "osd pool get "*" "*" --format json")
                 # Phase 5.3-prep: pool-get fixtures live at
@@ -973,42 +974,23 @@ ingest_current_config() {
     current_osd_mclock_max_capacity_iops_ssd=$(_cfg_lookup osd_mclock_max_capacity_iops_ssd)
 }
 
-# Phase 1.7: scrub backlog summary. Counts PGs whose last_deep_scrub_stamp
-# (and last_scrub_stamp) are older than the configured interval.
+# Phase 1.7: scrub backlog summary. Reads Ceph's own health checks
+# rather than parsing per-PG timestamps — Reef's pg dump pgs_brief
+# doesn't carry scrub stamps anymore, and the date math was fragile
+# anyway. PG_NOT_SCRUBBED and PG_NOT_DEEP_SCRUBBED checks are
+# authoritative (they're what `ceph status` reports).
 backlog_summary=""
 ingest_scrub_backlog() {
-    local pgs now_epoch
+    local health pgs
+    health=$(run_ceph health detail --format json) || exit 4
     pgs=$(run_ceph pg dump pgs_brief --format json) || exit 4
-    now_epoch=$(date +%s)
 
-    # Ceph stores these as floats ("604800.000000"). Strip the decimal
-    # so bash arithmetic doesn't silently fail — without this strip the
-    # `[ A -gt B ]` comparisons emit "integer expression expected" and
-    # the backlog counts come back as 0 on real clusters.
-    local deep_iv="${current_osd_deep_scrub_interval:-604800}"
-    local scrub_iv="${current_osd_scrub_max_interval:-604800}"
-    deep_iv="${deep_iv%.*}"
-    scrub_iv="${scrub_iv%.*}"
-
-    local total_pgs deep_late=0 scrub_late=0
+    local total_pgs deep_late scrub_late
     total_pgs=$(echo "$pgs" | jq '.pg_stats | length')
+    deep_late=$(echo "$health"  | jq -r '.checks.PG_NOT_DEEP_SCRUBBED.summary.count // 0')
+    scrub_late=$(echo "$health" | jq -r '.checks.PG_NOT_SCRUBBED.summary.count // 0')
 
-    # jq emits "<deep_stamp> <scrub_stamp>" lines; we parse each timestamp
-    # with `date -d` (GNU date handles the subseconds and +0000 zone).
-    local deep_stamp scrub_stamp deep_epoch scrub_epoch
-    while read -r deep_stamp scrub_stamp; do
-        [ -z "$deep_stamp" ] && continue
-        deep_epoch=$(date -d "${deep_stamp//+0000/+00:00}" +%s 2>/dev/null || echo 0)
-        scrub_epoch=$(date -d "${scrub_stamp//+0000/+00:00}" +%s 2>/dev/null || echo 0)
-        if [ "$deep_epoch" -gt 0 ] && [ $((now_epoch - deep_epoch)) -gt "$deep_iv" ]; then
-            deep_late=$((deep_late + 1))
-        fi
-        if [ "$scrub_epoch" -gt 0 ] && [ $((now_epoch - scrub_epoch)) -gt "$scrub_iv" ]; then
-            scrub_late=$((scrub_late + 1))
-        fi
-    done < <(echo "$pgs" | jq -r '.pg_stats[] | "\(.last_deep_scrub_stamp) \(.last_scrub_stamp)"')
-
-    backlog_summary="${total_pgs} PGs total; ${scrub_late} past scrub interval (${scrub_iv}s); ${deep_late} past deep-scrub interval (${deep_iv}s)"
+    backlog_summary="${total_pgs} PGs total; ${scrub_late} past scrub interval; ${deep_late} past deep-scrub interval"
 }
 
 # Phase 1.5: render proposed settings as a current → proposed diff.
@@ -1375,7 +1357,7 @@ compute_class_overrides
 
 # Phase 1.7: backlog summary in cluster mode.
 if [ "$FROM_CLUSTER" -eq 1 ] && [ -n "$backlog_summary" ]; then
-    print_header "Scrub Backlog (from 'ceph pg dump pgs_brief')"
+    print_header "Scrub Backlog (from 'ceph health detail')"
     echo "  $backlog_summary"
 fi
 

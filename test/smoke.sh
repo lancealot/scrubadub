@@ -271,12 +271,12 @@ out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
 check_not "no warning when EC profile is readable"  "$out" "couldn't read EC profile"
 check     "EC factor still 11/8 via profile lookup" "$out" "ec-archive' (11/8)"
 
-# 17b. Backlog detection: scrub_iv/deep_iv come back from Ceph as floats
-# ("604800.000000"). Without the %.* strip, bash arithmetic errored and
-# both counts came back as 0. Verify the deep-scrub count is non-zero
-# (the fixture has 6 PGs past the deep-scrub interval).
-check     "backlog count is non-zero with floats"   "$out" "6 past deep-scrub interval"
-check_not "no decimal in interval display"          "$out" "604800.000000s"
+# 17b. Backlog detection switched from per-PG timestamp parsing (which
+# Reef's pgs_brief no longer carries) to Ceph's own health-check counts.
+# Fixture asserts 6 deep + 2 shallow late.
+check     "deep-scrub backlog count read from health" "$out" "6 past deep-scrub interval"
+check     "shallow-scrub backlog count read from health" "$out" "2 past scrub interval"
+check     "section header points at the right source" "$out" "from 'ceph health detail'"
 
 # 17c. NIC auto-detect warns about local-node measurement. (Can't actually
 # fire here since the test container has no live NICs, so we just verify
