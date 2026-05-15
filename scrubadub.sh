@@ -767,7 +767,9 @@ ingest_pg_distribution() {
     if [ -n "$report" ]; then
         pg_imbalance_warning="$report"
     fi
-    print_notice "PG distribution: HDD=$hdd_pg_count SSD=$ssd_pg_count NVMe=$nvme_pg_count"
+    # These are PG-OSD assignment counts (each PG counted once per
+    # replica/chunk), not unique-PG counts. Used for per-OSD averages.
+    print_notice "PG-OSD assignments by class: HDD=$hdd_pg_count SSD=$ssd_pg_count NVMe=$nvme_pg_count"
     if [ -n "$pg_imbalance_warning" ]; then
         while IFS= read -r line; do
             print_warning "PG imbalance — $line"
@@ -836,7 +838,6 @@ ingest_pool_details() {
         row_count=$((row_count + 1))
         total_stored=$((total_stored + stored))
         total_pgs=$((total_pgs + pg_num))
-
         # Determine read-overhead factor for this pool.
         local factor_num=3 factor_den=1
         if [ "$ptype" = "3" ]; then
@@ -886,6 +887,11 @@ ingest_pool_details() {
         DATA_FACTOR_DEN=$largest_factor_den
         DATA_FACTOR_SOURCE="largest pool '$largest_name' (${largest_factor_num}/${largest_factor_den})"
     fi
+
+    # Expose the unique PG count globally. The scrub-time calculation
+    # needs this (not the sum of per-OSD assignment counts from
+    # `osd df tree`, which double-counts every PG by its chunk width).
+    total_unique_pgs=$total_pgs
 
     # Phase 4.2: walk pools again for per-pool overrides and footgun flags.
     # Hot pools (small avg object size) want shorter deep-scrub intervals;
@@ -1278,7 +1284,7 @@ if [ "$hdd_count" -gt 0 ]; then
     total_throughput=$((total_throughput + hdd_tp))
     total_iops=$((total_iops + hdd_io))
     echo "HDD OSDs: $hdd_count"
-    echo "  - PGs: $hdd_pg_count (avg $(calculate_pg_per_osd "$hdd_pg_count" "$hdd_count") PGs/OSD)"
+    echo "  - PG replicas: $hdd_pg_count (avg $(calculate_pg_per_osd "$hdd_pg_count" "$hdd_count") per OSD)"
     echo "  - Raw throughput: $hdd_tp MB/s (${HDD_THROUGHPUT} MB/s/OSD)"
     echo "  - IOPS: $hdd_io (${HDD_IOPS}/OSD, source: $HDD_IOPS_SOURCE)"
 fi
@@ -1287,7 +1293,7 @@ if [ "$ssd_count" -gt 0 ]; then
     total_throughput=$((total_throughput + ssd_tp))
     total_iops=$((total_iops + ssd_io))
     echo "SSD OSDs: $ssd_count"
-    echo "  - PGs: $ssd_pg_count (avg $(calculate_pg_per_osd "$ssd_pg_count" "$ssd_count") PGs/OSD)"
+    echo "  - PG replicas: $ssd_pg_count (avg $(calculate_pg_per_osd "$ssd_pg_count" "$ssd_count") per OSD)"
     echo "  - Raw throughput: $ssd_tp MB/s (${SSD_THROUGHPUT} MB/s/OSD)"
     echo "  - IOPS: $ssd_io (${SSD_IOPS}/OSD, source: $SSD_IOPS_SOURCE)"
 fi
@@ -1296,7 +1302,7 @@ if [ "$nvme_count" -gt 0 ]; then
     total_throughput=$((total_throughput + nvme_tp))
     total_iops=$((total_iops + nvme_io))
     echo "NVMe OSDs: $nvme_count"
-    echo "  - PGs: $nvme_pg_count (avg $(calculate_pg_per_osd "$nvme_pg_count" "$nvme_count") PGs/OSD)"
+    echo "  - PG replicas: $nvme_pg_count (avg $(calculate_pg_per_osd "$nvme_pg_count" "$nvme_count") per OSD)"
     echo "  - Raw throughput: $nvme_tp MB/s (${NVME_THROUGHPUT} MB/s/OSD)"
     echo "  - IOPS: $nvme_io (${NVME_IOPS}/OSD, source: $NVME_IOPS_SOURCE)"
 fi
@@ -1328,8 +1334,14 @@ echo "  - IOPS estimate:       $total_iops"
 echo "  - Data factor:         $DATA_FACTOR_SOURCE"
 echo "  - Avg PG size:         $AVG_PG_SIZE GB ($AVG_PG_SIZE_SOURCE)"
 
+# Use unique PG count (from ingest_pool_details), not the sum of
+# per-OSD assignments. Each PG occupies size/k+m OSDs but only
+# stores AVG_PG_SIZE worth of unique data; the OSD-assignment sum
+# would over-count by the chunk width (~17x on EC-heavy clusters).
+# total_pgs (assignments) is still used for the per-host concurrency
+# check below — that's correctly per-OSD.
 total_pgs=$((hdd_pg_count + ssd_pg_count + nvme_pg_count))
-estimated_scrub_time=$(calculate_scrub_time "$total_pgs" "$effective_ceiling")
+estimated_scrub_time=$(calculate_scrub_time "${total_unique_pgs:-$total_pgs}" "$effective_ceiling")
 est_days=$((estimated_scrub_time / 24))
 
 # Phase 3.3: shallow estimate. Shallow scrub reads object metadata and

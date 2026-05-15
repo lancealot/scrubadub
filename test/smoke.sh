@@ -113,7 +113,7 @@ echo "Test 7: Phase 3 — network ceiling"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 2>&1)
 check     "1 GbE × 3 hosts → 375 MB/s ceiling"  "$out" "Network ceiling:     375 MB/s"
 check     "binding ceiling shows network-bound" "$out" "network-bound"
-check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~324 hours"
+check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~260 hours"
 
 # No --nic-gbps in prompt mode → no network ceiling
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
@@ -285,6 +285,16 @@ check_not "no decimal in interval display"          "$out" "604800.000000s"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 50 2>&1)
 check_not "no local-node NIC warning when overridden" "$out" "NIC speed auto-detected from THIS node"
 check     "explicit --nic-gbps source shown"          "$out" "source: --nic-gbps"
+
+# 17d. Scrub-time math uses unique PG count, not OSD-assignment sum.
+# Fixture has 912 unique PGs and 1136 OSD-assignments. Estimated
+# scrub-time with the old (broken) formula was ~37h; with the fix it's
+# ~29h (using 912 × 28 GB × 11/8 / 330 MB/s).
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "scrub-time uses unique-PG count"           "$out" "Deep scrub time:     ~29 hours"
+check     "per-class label says 'PG replicas'"        "$out" "PG replicas: 896 (avg 99 per OSD)"
+check_not "old 'PGs:' label gone from per-class"      "$out" "  - PGs: 896"
+check     "ingest notice uses 'PG-OSD assignments'"   "$out" "PG-OSD assignments by class"
 
 echo
 echo "Results: $pass passed, $fail failed"
