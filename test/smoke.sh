@@ -196,5 +196,38 @@ set -e
 check     "rejects float"                        "$out" "must be an integer 1-100"
 
 echo
+echo "Test 14: Phase 5.1 — --dry-run is today's default"
+out_default=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+out_dryrun=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --dry-run 2>&1)
+if [ "$out_default" = "$out_dryrun" ]; then
+    echo "  PASS: --dry-run output matches default"
+    pass=$((pass + 1))
+else
+    echo "  FAIL: --dry-run output differs from default"
+    fail=$((fail + 1))
+fi
+help_out=$("$SB" --help 2>&1)
+check     "help advertises --dry-run"               "$help_out" "--dry-run"
+check     "help advertises --diff"                  "$help_out" "--diff"
+
+echo
+echo "Test 15: Phase 5.2 — --diff emits delta and exits"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --diff 2>&1)
+check     "diff section appears"                    "$out" "Proposed Changes"
+check     "per-class section appears in diff"       "$out" "Per-class scheduler overrides"
+check     "per-pool section appears in diff"        "$out" "Per-pool overrides"
+check     "diff exit notice shown"                  "$out" "Diff-only mode"
+check_not "apply commands suppressed under --diff"  "$out" "Recommended Configuration Commands"
+check_not "perf analysis suppressed under --diff"   "$out" "Performance Impact Analysis"
+check_not "notes suppressed under --diff"           "$out" "osd_scrub_load_threshold is normalized"
+
+# --diff requires --from-cluster.
+set +e
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq --diff 2>&1); rc=$?
+set -e
+check     "--diff without --from-cluster errors"    "$out" "--diff requires --from-cluster"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --diff without --from-cluster should exit non-zero"; fail=$((fail + 1)); }
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -60,6 +60,11 @@ FROM_CLUSTER=0
 FORCE_NON_MON=0
 WORKLOAD_TYPE=""   # 1/2/3/4; if set via --workload, skips the prompt
 
+# Phase 5: apply / diff / rollback. Default behavior stays read-only;
+# mutating modes are opt-in. DRY_RUN is the named form of today's default.
+DRY_RUN=1            # 0 only when --apply is given
+DIFF_ONLY=0          # --diff: emit just the delta and exit
+
 # Phase 3: honest performance model.
 NIC_GBPS=""          # --nic-gbps; per-host NIC speed in Gbps
 HOST_COUNT=""        # --hosts (prompt mode); auto-detected in --from-cluster
@@ -134,6 +139,14 @@ Tuning options:
   --device-profile FILE   Source KEY=VALUE overrides for device constants.
                           Keys: HDD_THROUGHPUT, HDD_IOPS, SSD_THROUGHPUT,
                           SSD_IOPS, NVME_THROUGHPUT, NVME_IOPS.
+
+Output modes (Phase 5):
+  --dry-run               Print the full report without modifying the
+                          cluster. This is the default; the flag is for
+                          intent-clarity in scripts.
+  --diff                  Print only the current → proposed delta
+                          (requires --from-cluster) and exit.
+
   -h, --help              Show this help.
 
 Environment variables:
@@ -201,6 +214,17 @@ parse_args() {
                 shift ;;
             --aggressive-scrubs)
                 AGGRESSIVE_SCRUBS=1
+                shift ;;
+            --dry-run)
+                # Today's default behavior, named explicitly. Together
+                # with the not-yet-built --apply flag this makes opt-in
+                # mutation the only way to write cluster state.
+                DRY_RUN=1
+                shift ;;
+            --diff)
+                # Print only the current → proposed delta from
+                # --from-cluster and exit, skipping the full report.
+                DIFF_ONLY=1
                 shift ;;
             --device-profile)
                 require_value "$1" "${2:-}"
@@ -1217,6 +1241,21 @@ if [ "${#class_overrides[@]}" -gt 0 ]; then
     done
 fi
 
+# Phase 5.2: --diff exits cleanly after rendering all proposed-change
+# sections. Skips backup commands, apply commands, perf analysis, notes.
+if [ "$DIFF_ONLY" -eq 1 ]; then
+    if [ "$FROM_CLUSTER" -ne 1 ]; then
+        print_error "--diff requires --from-cluster (need real current state to diff against)."
+        exit 2
+    fi
+    # The per-class/per-pool sections still need to render — they're
+    # part of the delta. Fall through to those, then exit before the
+    # 'Recommended Configuration Commands' section.
+    DIFF_EXIT_AFTER_OVERRIDES=1
+else
+    DIFF_EXIT_AFTER_OVERRIDES=0
+fi
+
 # Phase 4.2: per-pool overrides and footgun warnings.
 if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
     print_header "Per-pool overrides"
@@ -1230,6 +1269,13 @@ if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
         kv="${override#*#}"
         printf "  %-24s %s  (small avg object size → tighten scrub cadence)\n" "$pname" "$kv"
     done
+fi
+
+# Phase 5.2: under --diff, stop here. The operator wanted just the delta.
+if [ "$DIFF_EXIT_AFTER_OVERRIDES" -eq 1 ]; then
+    echo
+    print_notice "Diff-only mode — backup/apply/perf sections omitted. Re-run without --diff for full report."
+    exit 0
 fi
 
 print_header "Current Configuration Backup Commands"
