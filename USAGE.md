@@ -17,6 +17,29 @@ Several items below describe v1 behavior that is being corrected in
 [ROADMAP.md Phase 0](ROADMAP.md#phase-0--correctness-fixes). Where the
 caveat affects you operationally, it's called out inline.
 
+## Command-line flags
+
+```
+--avg-pg-size-gb N      Average PG size in GB (default: 4, a guess).
+--replica-size N        Treat pools as N-way replicated (default: 3).
+--ec-ratio k+m          Treat pools as erasure-coded k+m (e.g. 8+3).
+                        Mutually exclusive with --replica-size.
+--scheduler {wpq|mclock}
+                        Active OSD op scheduler. Prompted if omitted.
+                        Under mClock, scrubadub omits the knobs the
+                        scheduler ignores and recommends a profile.
+--hyperconverged        Other workloads share the OSD hosts. Allows
+                        more aggressive osd_scrub_load_threshold under
+                        WPQ.
+--aggressive-scrubs     Allow osd_max_scrubs up to 3 (default cap: 2).
+                        Verify per-host headroom first.
+--device-profile FILE   Override device baselines (KEY=VALUE file).
+-h, --help              Show help.
+```
+
+Environment variables: `PG_SIZE_GB`, `SCRUB_BUDGET_PERCENT`, and any of
+the device constants from `--device-profile`.
+
 ## Prerequisites
 Before running scrubadub, gather the following information from your Ceph cluster:
 
@@ -29,6 +52,9 @@ ceph pg dump pools --format json-pretty
 
 # Get current scrub settings (save this for backup)
 ceph config dump | grep -E 'scrub|osd_max_scrubs'
+
+# Check the active OSD op scheduler (wpq or mclock_scheduler)
+ceph config get osd osd_op_queue
 ```
 
 ## Required Information
@@ -36,6 +62,7 @@ You will need to provide:
 1. Number of OSDs for each device type (HDD/SSD/NVMe)
 2. Total PG count for each device type
 3. Primary workload characteristics
+4. Active OSD op scheduler (WPQ or mClock)
 
 ## Workload Types
 The script supports four workload profiles:
@@ -73,25 +100,34 @@ The script provides:
 - `osd_deep_scrub_interval`: Time between deep scrubs (seconds)
 - `osd_max_scrubs`: Maximum concurrent scrubs per OSD
 - `osd_scrub_load_threshold`: Maximum normalized load (`loadavg / num_cpus`, **not** raw loadavg) before scrubs are deferred. On a 16-core host with the default `0.5`, scrubs pause when loadavg exceeds 8. Ignored when the **mClock** scheduler is active. Tightened semantics in ROADMAP Phase 0.8.
-- `osd_scrub_sleep`: Time to sleep between scrub chunks, in **seconds** (float, e.g. `0.1`). Ignored when the **mClock** scheduler is active. v1 currently emits integer values (e.g. `30`) — those are wrong; treat them as seconds and divide by ~150 for a sane starting point. Fixed in ROADMAP Phase 0.1.
-- `osd_scrub_begin_hour`: Hour to begin allowing scrubs (0-23)
-- `osd_scrub_end_hour`: Hour to stop allowing scrubs (0-23)
+- `osd_scrub_sleep`: Time to sleep between scrub chunks, in **seconds** (float, e.g. `0.1`). Ignored when the **mClock** scheduler is active.
+- `osd_scrub_interval_randomize_ratio`: Spreads scheduled scrubs in time to avoid synchronized scrub storms after tightening intervals. Default `0.5` (a PG's actual interval is randomized within ±50%).
+- `osd_scrub_begin_hour`: Hour to begin allowing scrubs (0–23). Pair with `_end_hour=0` for an open-ended (24-hour) window.
+- `osd_scrub_end_hour`: Hour to stop allowing scrubs. **`0` is the Ceph convention for "no end" / 24 hours**, not "midnight".
+- `osd_mclock_profile`: mClock profile (`high_client_ops` / `balanced` / `high_recovery_ops`). Recommended only when the mClock scheduler is active.
 
-### Default Values
+### Default Values (what scrubadub recommends as a starting point)
 - `osd_scrub_min_interval`: 86400 (24 hours)
 - `osd_scrub_max_interval`: 604800 (7 days)
 - `osd_deep_scrub_interval`: 604800 (7 days)
-- `osd_max_scrubs`: 1 (may be increased based on scrub time estimates)
-- `osd_scrub_load_threshold`: 0.5
-- `osd_scrub_sleep`: 0
-- `osd_scrub_begin_hour`: 1 (1 AM)
-- `osd_scrub_end_hour`: 7 (7 AM)
+- `osd_max_scrubs`: 1 (capped at 2; `--aggressive-scrubs` allows 3)
+- `osd_scrub_load_threshold`: 0.5 (lower under `--hyperconverged` + WPQ)
+- `osd_scrub_sleep`: 0.1 seconds (WPQ only; omitted under mClock)
+- `osd_scrub_interval_randomize_ratio`: 0.5
+- `osd_scrub_begin_hour`: 1 (1 AM); Archival profile uses 0
+- `osd_scrub_end_hour`: 7 (7 AM); Archival profile uses 0 (24h)
 
 ### Performance Characteristics
-The tool uses these baseline performance metrics for calculations:
-- HDDs: ~150 MB/s, ~125 IOPS
-- SSDs: ~475 MB/s, ~70,000 IOPS
-- NVMe: ~2,750 MB/s, ~600,000 IOPS
+The tool uses these baseline performance metrics for calculations
+(refreshed in Phase 0.11 — these are still order-of-magnitude):
+- HDDs: ~200 MB/s, ~150 IOPS (modern 12 TB+ CMR)
+- SSDs: ~500 MB/s, ~75,000 IOPS (SATA SSD baseline; SAS SSDs are ~3× faster)
+- NVMe: ~3,500 MB/s, ~600,000 IOPS (Gen3–Gen4 median; Gen5 is ~2× faster)
+
+Override via `--device-profile <file>` (a `KEY=VALUE` shell-sourceable
+file with any of `HDD_THROUGHPUT`, `HDD_IOPS`, `SSD_THROUGHPUT`,
+`SSD_IOPS`, `NVME_THROUGHPUT`, `NVME_IOPS`) or by exporting the same
+names as environment variables.
 
 These values are used to estimate:
 - Total cluster throughput

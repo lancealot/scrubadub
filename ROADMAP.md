@@ -33,15 +33,26 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1)
+## Current baseline (v1.1)
 
-- `scrubadub.sh` — bash-only, ~400 lines, interactive prompts.
-- Emits WPQ-shaped settings (`osd_scrub_sleep`, `osd_scrub_load_threshold`,
-  intervals, `osd_max_scrubs`, begin/end_hour).
-- Hardcoded device throughput/IOPS constants.
-- `AVG_PG_SIZE` fixed at 4 GB.
-- No knowledge of replication factor, EC, network ceiling, or scheduler.
-- No `--apply` / `--diff` / `--rollback`; only prints recommendations.
+After Phase 0:
+
+- Scheduler-aware: detects (via prompt or `--scheduler`) WPQ vs mClock
+  and suppresses settings mClock ignores. Recommends an
+  `osd_mclock_profile` under mClock.
+- `osd_scrub_sleep` is now seconds-typed (floats); `osd_max_scrubs`
+  capped at 2 by default (3 with `--aggressive-scrubs`).
+- Emits `osd_scrub_interval_randomize_ratio` to avoid synchronized
+  scrub storms.
+- Replication / EC factor honored via `--replica-size` / `--ec-ratio`
+  (default 3× replicated).
+- Scrub-time estimate uses a `SCRUB_BUDGET_PERCENT` (default 10%) of
+  total throughput instead of pretending scrubs get 100%.
+- Device baselines refreshed and overridable via `--device-profile`.
+- `--avg-pg-size-gb` / `PG_SIZE_GB` to override the 4 GB guess; banner
+  shown on default.
+- Still prompt-driven; Phase 1 adds `--from-cluster` ingestion.
+- Still no `--apply` / `--diff` / `--rollback`; Phase 5 adds them.
 
 ---
 
@@ -64,7 +75,7 @@ Ceph node anyway. No Python rewrite is planned.
 Small, surgical edits to the existing bash. Most are 1–5 lines plus a
 docs touch.
 
-### `[ ]` 0.1 Fix `osd_scrub_sleep` units in docs and output
+### `[x]` 0.1 Fix `osd_scrub_sleep` units in docs and output
 **Why.** `USAGE.md:62` says microseconds. Ceph's actual unit is **seconds
 (float)**. Today the script emits `10`/`15`/`20`/`30`, which tells the
 OSD to sleep that many seconds between chunks — effectively halting
@@ -75,7 +86,7 @@ seconds. Add an inline comment in `scrubadub.sh` citing the Ceph docs.
 **Accept.** Docs read "seconds"; recommended values are floats; comment
 present.
 
-### `[ ]` 0.2 Fix archival 24-hour window
+### `[x]` 0.2 Fix archival 24-hour window
 **Why.** `scrubadub.sh:179-180` sets `begin=0, end=23`, which excludes
 23:00–00:00. Ceph's convention for "all day" is `begin=0, end=0`.
 **What.** Change archival profile to emit `begin=0, end=0`.
@@ -83,7 +94,7 @@ present.
 **Accept.** Archival profile prints `osd_scrub_begin_hour = 0` and
 `osd_scrub_end_hour = 0`.
 
-### `[ ]` 0.3 Cap `osd_max_scrubs` and warn before raising
+### `[x]` 0.3 Cap `osd_max_scrubs` and warn before raising
 **Why.** `scrubadub.sh:185-191` can compound `+1` and `+2` without bound.
 On a 12-OSDs-per-host cluster, `osd_max_scrubs=3` means 36 simultaneous
 scrubs per host — client-killer.
@@ -95,7 +106,7 @@ explains the per-host concurrency cost
 **Accept.** Script never emits `osd_max_scrubs > 3`; warning shown when
 the value is raised above the baseline.
 
-### `[ ]` 0.4 Emit `osd_scrub_interval_randomize_ratio`
+### `[x]` 0.4 Emit `osd_scrub_interval_randomize_ratio`
 **Why.** Default 0.5 spreads scrubs in time. Users who tighten intervals
 without this risk a synchronized scrub storm.
 **What.** Include `osd_scrub_interval_randomize_ratio = 0.5` in the
@@ -103,7 +114,7 @@ recommendations output. Add to USAGE.md "Key Parameters Explained".
 **Files.** `scrubadub.sh:194-202`, `USAGE.md:56-65`.
 **Accept.** Parameter appears in output and in the docs table.
 
-### `[ ]` 0.5 Make `AVG_PG_SIZE` overridable + add a notice
+### `[x]` 0.5 Make `AVG_PG_SIZE` overridable + add a notice
 **Why.** Hardcoded 4 GB at `scrubadub.sh:17` is the single biggest source
 of bad estimates. Real PG size varies wildly per pool (KB to tens of GB).
 **What.** Accept `--avg-pg-size-gb N` (and `PG_SIZE_GB=` env var). Print
@@ -112,7 +123,7 @@ with a real number from `ceph df detail`.)
 **Files.** `scrubadub.sh:17` and the input/arg-parsing section.
 **Accept.** Flag works; banner appears on default.
 
-### `[ ]` 0.6 Scheduler-detect banner
+### `[x]` 0.6 Scheduler-detect banner
 **Why.** mClock silently ignores sleep and load-threshold knobs. Today
 the tool prints them anyway with no warning, which gives operators false
 confidence on Reef/Squid clusters.
@@ -123,7 +134,7 @@ ignored knobs and link to Ceph's mClock config reference and Clyso's
 **Files.** `scrubadub.sh:205-273`.
 **Accept.** Banner renders for both schedulers; links resolve.
 
-### `[ ]` 0.7 Don't emit settings the active scheduler ignores
+### `[x]` 0.7 Don't emit settings the active scheduler ignores
 **Why.** Companion to 0.6. If mClock ignores them, don't print them.
 **What.** When the user/script declares mClock, suppress
 `osd_scrub_sleep` and `osd_scrub_load_threshold` from the recommended
@@ -132,7 +143,7 @@ their place.
 **Files.** `scrubadub.sh:194-202`.
 **Accept.** Under mClock, those two lines are absent from output.
 
-### `[ ]` 0.8 Fix `osd_scrub_load_threshold` semantics
+### `[x]` 0.8 Fix `osd_scrub_load_threshold` semantics
 **Why.** The threshold is `loadavg / num_cpus`, **not** raw loadavg.
 Today's workload-bucket values (0.2, 0.3) effectively disable scrubs on
 any busy host. Defaults aren't tied to the user's actual core count.
@@ -144,7 +155,7 @@ and bump the baseline values).
 **Accept.** Docs and comment in place; baseline values ≥ 0.5 in
 non-hyperconverged profiles.
 
-### `[ ]` 0.9 Honest scrub-time estimate
+### `[x]` 0.9 Honest scrub-time estimate
 **Why.** `scrubadub.sh:122` divides total data by full cluster throughput,
 implying scrubs run flat out. They don't — and shouldn't. Real scrub
 budget is ~10–15% of total bandwidth.
@@ -156,7 +167,7 @@ is actually correct).
 **Accept.** Estimate is roughly 10× current for the same inputs; warnings
 fire on realistic clusters.
 
-### `[ ]` 0.10 Replication / EC factor in bytes-to-scrub
+### `[x]` 0.10 Replication / EC factor in bytes-to-scrub
 **Why.** Deep scrub on replicated×3 reads `3×` the stored bytes across
 the PG set; EC `k+m` reads `(k+m)/k`×. The current model treats raw
 stored bytes as the scrub workload.
@@ -168,7 +179,7 @@ values.)
 **Accept.** Estimate scales with the factor; flags documented in
 USAGE.md.
 
-### `[ ]` 0.11 Refresh device baselines + make them overridable
+### `[x]` 0.11 Refresh device baselines + make them overridable
 **Why.** `scrubadub.sh:9-14` baselines are dated and conflate generations
 (SATA-SSD vs SAS-SSD, NVMe Gen3 vs Gen4 vs Gen5).
 **What.** Update built-in defaults — HDD 200 MB/s, SATA-SSD 500 MB/s,
