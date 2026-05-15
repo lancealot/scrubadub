@@ -463,5 +463,4 @@ utilization, and headroom against `osd_deep_scrub_interval`.
 - [Ceph Squid release notes](https://docs.ceph.com/en/latest/releases/squid/)
 - [Clyso: how to disable mClock scheduler](https://www.clyso.com/blog/ceph-how-do-disable-mclock-scheduler/)
 - [Clyso: blocked requests caused by deep-scrubbing](https://docs.clyso.com/blog/ceph-blocked-requests-in-the-cluster-caused-by-deep-scrubing-operations/)
-- [scrubadub internal projectplan.md](./projectplan.md)
 - [USAGE.md](./USAGE.md)
