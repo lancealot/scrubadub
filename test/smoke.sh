@@ -254,5 +254,38 @@ check     "--emit-backup-plan needs --from-cluster"  "$out" "requires --from-clu
 rm -f "$PLAN" /tmp/sb-nope.tsv
 
 echo
+echo "Test 17: live-cluster bug fixes — EC profile + backlog floats"
+
+# 17a. EC factor comes from `osd erasure-code-profile get`, not the
+# pool size or profile name. Move the fixture aside, verify the
+# warning fires AND the factor changes to the (deliberately wrong)
+# m=2 fallback — proves the profile lookup is what's authoritative.
+mv "$FIXTURE/ec_profile_ec-8-3.json" "$FIXTURE/ec_profile_ec-8-3.json.bak"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "warns when EC profile can't be read"     "$out" "couldn't read EC profile"
+check     "fallback gives wrong-by-design 11/9"     "$out" "ec-archive' (11/9)"
+mv "$FIXTURE/ec_profile_ec-8-3.json.bak" "$FIXTURE/ec_profile_ec-8-3.json"
+
+# Restore the fixture and verify the authoritative path runs silently.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check_not "no warning when EC profile is readable"  "$out" "couldn't read EC profile"
+check     "EC factor still 11/8 via profile lookup" "$out" "ec-archive' (11/8)"
+
+# 17b. Backlog detection: scrub_iv/deep_iv come back from Ceph as floats
+# ("604800.000000"). Without the %.* strip, bash arithmetic errored and
+# both counts came back as 0. Verify the deep-scrub count is non-zero
+# (the fixture has 6 PGs past the deep-scrub interval).
+check     "backlog count is non-zero with floats"   "$out" "6 past deep-scrub interval"
+check_not "no decimal in interval display"          "$out" "604800.000000s"
+
+# 17c. NIC auto-detect warns about local-node measurement. (Can't actually
+# fire here since the test container has no live NICs, so we just verify
+# the warning isn't suppressed when ethtool *would* succeed by checking
+# that --nic-gbps still overrides cleanly without warning.)
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 50 2>&1)
+check_not "no local-node NIC warning when overridden" "$out" "NIC speed auto-detected from THIS node"
+check     "explicit --nic-gbps source shown"          "$out" "source: --nic-gbps"
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

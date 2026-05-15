@@ -621,6 +621,13 @@ run_ceph() {
                 local args=($*)
                 fixture="pool_get_${args[3]}_${args[4]}.json"
                 [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
+            "osd erasure-code-profile get "*" --format json")
+                # Phase 1.4 (live-cluster fix): EC profile fixtures
+                # live at ec_profile_<name>.json. Missing file silently
+                # returns non-zero so the caller falls back.
+                local args=($*)
+                fixture="ec_profile_${args[3]}.json"
+                [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
             *)
                 print_error "run_ceph: no fixture mapped for: ceph $*"
                 return 1 ;;
@@ -717,7 +724,13 @@ compute_network_ceiling() {
         if [ "$detected" -gt 0 ]; then
             # Convert Mbps -> Gbps for display; keep Mbps for math.
             NIC_GBPS=$(awk "BEGIN { printf \"%g\", $detected / 1000 }")
-            NIC_SOURCE="ethtool"
+            NIC_SOURCE="ethtool (local node)"
+            # ethtool only sees THIS host's NIC. On a mon-only node the
+            # OSD nodes may have a faster (or slower) NIC, in which case
+            # the network ceiling is wrong. Encourage --nic-gbps when
+            # the operator knows the OSD-side speed.
+            print_warning "NIC speed auto-detected from THIS node's interfaces (${NIC_GBPS} Gbps)."
+            print_warning "  If the OSD nodes have different NICs, pass --nic-gbps N to override."
         fi
     fi
     if [ -n "$NIC_GBPS" ] && [ -n "$HOST_COUNT" ] && [ "$HOST_COUNT" -gt 0 ]; then
@@ -763,6 +776,31 @@ ingest_pg_distribution() {
     fi
 }
 
+# Phase 1.4 helper: look up an EC profile's k and m by name. Caches
+# results in EC_PROFILE_CACHE_<name> globals so we make at most one
+# `ceph` call per profile per run. Echoes "<k> <m>" on stdout, or
+# empty if the profile can't be read.
+ec_profile_km() {
+    local profile=$1
+    [ -z "$profile" ] && return
+    # Bash variable names can't contain dots / dashes; sanitize the key.
+    local cache_key="EC_PROFILE_CACHE_${profile//[^A-Za-z0-9_]/_}"
+    if [ -n "${!cache_key:-}" ]; then
+        echo "${!cache_key}"
+        return
+    fi
+    local json k m
+    json=$(run_ceph osd erasure-code-profile get "$profile" --format json 2>/dev/null || true)
+    if [ -n "$json" ]; then
+        k=$(echo "$json" | jq -r '.k // empty')
+        m=$(echo "$json" | jq -r '.m // empty')
+    fi
+    if [ -n "$k" ] && [ -n "$m" ]; then
+        printf -v "$cache_key" '%s %s' "$k" "$m"
+        echo "$k $m"
+    fi
+}
+
 # Phase 1.4: compute weighted-average PG size from real per-pool data.
 # Updates AVG_PG_SIZE and AVG_PG_SIZE_SOURCE if the user didn't override.
 # Also derives DATA_FACTOR if it was left at the default — uses the
@@ -802,16 +840,22 @@ ingest_pool_details() {
         # Determine read-overhead factor for this pool.
         local factor_num=3 factor_den=1
         if [ "$ptype" = "3" ]; then
-            # EC pool: psize is k+m on Ceph >= reef. Try to parse k+m from ec_profile name.
-            if [[ "$ec_profile" =~ ec-([0-9]+)-([0-9]+) ]]; then
-                local k="${BASH_REMATCH[1]}"
-                local m="${BASH_REMATCH[2]}"
+            # EC pool. We need k and m. They're authoritative on the
+            # erasure-code-profile, not derivable from the pool size or
+            # profile name (real-world profile names don't follow any
+            # convention — "ec-16-4" doesn't always parse to 16+4).
+            # Query the profile by name, cache the result.
+            local k m
+            read -r k m <<< "$(ec_profile_km "$ec_profile")"
+            if [ -n "$k" ] && [ -n "$m" ] && [ "$k" -gt 0 ]; then
                 factor_num=$((k + m))
                 factor_den=$k
             else
-                # Fallback: assume psize == k+m and k=size-2 (typical default profile k+2).
+                # Last-resort fallback: psize is k+m on Reef, but we
+                # don't know how m splits from k. Assume m=2 and warn.
                 factor_num=$psize
                 factor_den=$((psize - 2 > 0 ? psize - 2 : 1))
+                print_warning "Pool '$name': couldn't read EC profile '$ec_profile'; assuming m=2." >&2
             fi
         else
             factor_num=$psize
@@ -931,8 +975,14 @@ ingest_scrub_backlog() {
     pgs=$(run_ceph pg dump pgs_brief --format json) || exit 4
     now_epoch=$(date +%s)
 
+    # Ceph stores these as floats ("604800.000000"). Strip the decimal
+    # so bash arithmetic doesn't silently fail — without this strip the
+    # `[ A -gt B ]` comparisons emit "integer expression expected" and
+    # the backlog counts come back as 0 on real clusters.
     local deep_iv="${current_osd_deep_scrub_interval:-604800}"
     local scrub_iv="${current_osd_scrub_max_interval:-604800}"
+    deep_iv="${deep_iv%.*}"
+    scrub_iv="${scrub_iv%.*}"
 
     local total_pgs deep_late=0 scrub_late=0
     total_pgs=$(echo "$pgs" | jq '.pg_stats | length')
