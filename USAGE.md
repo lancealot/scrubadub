@@ -195,15 +195,69 @@ Check yours:
 ceph config get osd osd_op_queue
 ```
 
-| Active scheduler | What scrubadub v1 emits | What's honored |
-|---|---|---|
-| `wpq` | All of v1's knobs (sleep, load_threshold, intervals, max_scrubs, window) | All of them |
-| `mclock_scheduler` | Same set | Only intervals, `osd_max_scrubs`, and the scrub window. `osd_scrub_sleep` and `osd_scrub_load_threshold` are **ignored**. |
+scrubadub picks an emitter based on whichever scheduler is active —
+it does **not** force one over the other.
 
-If you're on mClock, prefer setting `osd_mclock_profile` to one of
-`high_client_ops`, `balanced`, or `high_recovery_ops` over tuning
-sleep/load_threshold. ROADMAP Phase 2.3 adds a proper mClock emitter to
-scrubadub.
+| Active scheduler | What scrubadub emits |
+|---|---|
+| `wpq` | `osd_scrub_min_interval`, `osd_scrub_max_interval`, `osd_deep_scrub_interval`, `osd_max_scrubs`, `osd_scrub_interval_randomize_ratio`, `osd_scrub_begin_hour`, `osd_scrub_end_hour`, **`osd_scrub_sleep`**, **`osd_scrub_load_threshold`** |
+| `mclock_scheduler` | Same set **minus** `osd_scrub_sleep` and `osd_scrub_load_threshold` (mClock ignores them), **plus** `osd_mclock_profile` |
+
+### mClock profile mapping
+
+scrubadub picks the profile from the workload bucket plus
+`--hyperconverged`:
+
+| Workload | Profile |
+|---|---|
+| Heavy Read | `high_client_ops` |
+| Heavy Write | `balanced` |
+| Mixed | `balanced` |
+| Archival | `balanced` |
+| any + `--hyperconverged` | `high_client_ops` |
+
+`high_recovery_ops` is reserved for the Phase 6.1 backlog-drain mode
+(not implemented yet).
+
+### Suspiciously low mClock IOPS
+
+Under `--from-cluster`, scrubadub reads
+`osd_mclock_max_capacity_iops_hdd` and `..._ssd` from `ceph config
+dump`. If either looks too low (HDD < 50 IOPS, SSD < 5000 IOPS),
+scrubadub prints an advisory to re-run the benchmark:
+
+```bash
+ceph config set osd osd_mclock_force_run_benchmark_on_init true
+# restart OSDs one host at a time
+ceph config set osd osd_mclock_force_run_benchmark_on_init false
+```
+
+Bad benchmarks are usually caused by a noisy host during OSD init —
+the benchmark runs once on first boot and the value sticks until you
+ask for a re-run.
+
+### Switching schedulers
+
+To move from mClock to WPQ:
+
+```bash
+ceph config set osd osd_op_queue wpq
+# restart OSDs one host at a time
+```
+
+The reverse:
+
+```bash
+ceph config rm osd osd_op_queue      # drop the override; the default since Ceph 17 is mClock
+# or explicitly:
+ceph config set osd osd_op_queue mclock_scheduler
+# then restart OSDs
+```
+
+Clyso's [post on disabling mClock](https://www.clyso.com/blog/ceph-how-do-disable-mclock-scheduler/)
+walks through the rationale and gotchas. The
+[Ceph mClock config reference](https://docs.ceph.com/en/reef/rados/configuration/mclock-config-ref/)
+documents every mClock-specific knob.
 
 References:
 - [Ceph mClock Config Reference](https://docs.ceph.com/en/reef/rados/configuration/mclock-config-ref/)

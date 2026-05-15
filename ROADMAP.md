@@ -33,9 +33,21 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1.2)
+## Current baseline (v1.3)
 
-After Phase 0 and Phase 1:
+After Phase 0, Phase 1, and Phase 2:
+
+Scheduler-aware output (Phase 2):
+- `calculate_scrub_settings` is now a dispatcher; each scheduler has
+  its own emitter (`emit_wpq_settings`, `emit_mclock_settings`). Both
+  are sourceable and callable as unit functions — `test/smoke.sh`
+  exercises them with a fixed value string.
+- mClock profile mapping: `high_client_ops` for read-heavy or
+  `--hyperconverged`, `balanced` for write/mixed/archival.
+- Under `--from-cluster`, scrubadub flags suspiciously low
+  `osd_mclock_max_capacity_iops_{hdd,ssd}` values and recommends
+  re-running the benchmark via `osd_mclock_force_run_benchmark_on_init`.
+- USAGE.md gained a "switching schedulers" section.
 
 Cluster ingest (Phase 1):
 - `--from-cluster` reads OSD inventory, per-class PG distribution
@@ -288,7 +300,7 @@ with it.
 
 ## Phase 2 — Scheduler-aware output (WPQ + mClock co-equal)
 
-### `[ ]` 2.1 Scheduler dispatch in `calculate_scrub_settings`
+### `[x]` 2.1 Scheduler dispatch in `calculate_scrub_settings`
 **Why.** Clean separation makes the two emitters easy to evolve.
 **What.** Route to `emit_wpq_settings` or `emit_mclock_settings` based
 on the detected/declared scheduler.
@@ -296,7 +308,7 @@ on the detected/declared scheduler.
 **Accept.** Each emitter is callable independently from a unit-style
 test fixture.
 
-### `[ ]` 2.2 WPQ emitter (current logic, corrected)
+### `[x]` 2.2 WPQ emitter (current logic, corrected)
 **Why.** This is the default path for clusters following Clyso's
 guidance.
 **What.** Fold in every Phase 0 correction (units, archival window,
@@ -306,7 +318,7 @@ max_scrubs cap, randomize_ratio, load_threshold semantics). Emit:
 `osd_scrub_interval_randomize_ratio`.
 **Accept.** Output is a strict superset of v1 minus the bugs.
 
-### `[ ]` 2.3 mClock emitter
+### `[x]` 2.3 mClock emitter
 **Why.** Don't emit settings mClock ignores; recommend the things it
 honors.
 **What.** Recommend an `osd_mclock_profile` based on the workload
@@ -319,7 +331,7 @@ suspiciously low. **Does not** emit `osd_scrub_sleep` or
 **Accept.** mClock output contains a profile recommendation and no
 sleep/load_threshold lines.
 
-### `[ ]` 2.4 Document switching schedulers
+### `[x]` 2.4 Document switching schedulers
 **Why.** Operators following Clyso's WPQ guidance need a pointer.
 **What.** Add a `USAGE.md` section linking to Clyso's "disable
 mClock" post and Ceph's mClock config reference. Make it clear that

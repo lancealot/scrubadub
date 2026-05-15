@@ -31,6 +31,17 @@ check() {
     fi
 }
 
+check_not() {
+    local name=$1 actual=$2 unexpected=$3
+    if echo "$actual" | grep -q -- "$unexpected"; then
+        echo "  FAIL: $name (should NOT contain: $unexpected)"
+        fail=$((fail + 1))
+    else
+        echo "  PASS: $name"
+        pass=$((pass + 1))
+    fi
+}
+
 echo "Test 1: --help works"
 out=$("$SB" --help 2>&1)
 check "help shows --from-cluster"   "$out" "--from-cluster"
@@ -68,6 +79,34 @@ out=$(CEPH_FIXTURE_DIR=/nonexistent "$SB" --from-cluster --workload mixed 2>&1);
 set -e
 check "missing fixture errors out"        "$out" "Fixture not readable"
 [ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: missing fixture exits non-zero"; fail=$((fail + 1)); }
+
+echo
+echo "Test 5: Phase 2 emitters callable directly"
+# Sourcing the script exposes the functions without running main.
+# shellcheck disable=SC1090
+source "$SB" >/dev/null 2>&1 || true
+sample="86400,604800,604800,2,0.5,1,7,0.1,0.5,balanced"
+
+out=$(emit_wpq_settings "$sample")
+check     "wpq emits min_interval"      "$out" "osd_scrub_min_interval = 86400"
+check     "wpq emits sleep"             "$out" "osd_scrub_sleep = 0.1"
+check     "wpq emits load_threshold"    "$out" "osd_scrub_load_threshold = 0.5"
+check_not "wpq omits mclock_profile"    "$out" "osd_mclock_profile"
+
+out=$(emit_mclock_settings "$sample")
+check     "mclock emits profile"        "$out" "osd_mclock_profile = balanced"
+check     "mclock emits intervals"      "$out" "osd_scrub_max_interval = 604800"
+check_not "mclock omits sleep"          "$out" "osd_scrub_sleep"
+check_not "mclock omits load_threshold" "$out" "osd_scrub_load_threshold"
+
+echo
+echo "Test 6: --from-cluster against the mclock fixture"
+MCLOCK_FIXTURE="$SCRIPT_DIR/fixtures/cluster_mclock"
+out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "mclock scheduler auto-detected"  "$out" "Active OSD op scheduler: mclock"
+check     "mclock benchmark advisory fires" "$out" "suspiciously low"
+check     "mclock recommends profile"       "$out" "osd_mclock_profile balanced"
+check_not "mclock recommendation omits sleep" "$out" "ceph config set osd osd_scrub_sleep"
 
 echo
 echo "Results: $pass passed, $fail failed"

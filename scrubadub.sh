@@ -300,9 +300,48 @@ scrub_window_for_workload() {
 # -----------------------------------------------------------------------------
 # Scrub settings
 # -----------------------------------------------------------------------------
-# Emits one "param = value" per line. Scheduler-aware: under mClock, knobs
-# the scheduler ignores are suppressed (Phase 0.7) and a profile is
-# recommended instead.
+# Phase 2 refactor: the dispatcher computes the values shared by both
+# schedulers, then delegates to a scheduler-specific emitter.
+#
+# Each emitter takes a single comma-separated VALUES string so it can be
+# called independently — useful for unit-style tests. The format is:
+#   min_interval,max_interval,deep_interval,max_scrubs,randomize_ratio,
+#   begin_hour,end_hour,scrub_sleep,load_threshold,mclock_profile
+
+# Phase 2.2: WPQ emitter. Emits all classic knobs.
+emit_wpq_settings() {
+    local v=$1
+    IFS=',' read -r min_iv max_iv deep_iv max_scrubs rr bh eh ss lt _profile <<< "$v"
+    echo "osd_scrub_min_interval = $min_iv"
+    echo "osd_scrub_max_interval = $max_iv"
+    echo "osd_deep_scrub_interval = $deep_iv"
+    echo "osd_max_scrubs = $max_scrubs"
+    echo "osd_scrub_interval_randomize_ratio = $rr"
+    echo "osd_scrub_begin_hour = $bh"
+    echo "osd_scrub_end_hour = $eh"
+    echo "osd_scrub_sleep = $ss"
+    echo "osd_scrub_load_threshold = $lt"
+}
+
+# Phase 2.3: mClock emitter. Emits intervals + max_scrubs + window +
+# randomize_ratio + the mClock profile. Does NOT emit sleep or
+# load_threshold (mClock ignores them).
+emit_mclock_settings() {
+    local v=$1
+    IFS=',' read -r min_iv max_iv deep_iv max_scrubs rr bh eh _ss _lt profile <<< "$v"
+    echo "osd_scrub_min_interval = $min_iv"
+    echo "osd_scrub_max_interval = $max_iv"
+    echo "osd_deep_scrub_interval = $deep_iv"
+    echo "osd_max_scrubs = $max_scrubs"
+    echo "osd_scrub_interval_randomize_ratio = $rr"
+    echo "osd_scrub_begin_hour = $bh"
+    echo "osd_scrub_end_hour = $eh"
+    echo "osd_mclock_profile = $profile"
+}
+
+# Phase 2.1: dispatcher. Computes the shared bucket-derived values, applies
+# PG-density / backlog adjustments, caps max_scrubs, and delegates to
+# the appropriate emitter.
 calculate_scrub_settings() {
     local total_osds=$1
     local max_pgs_per_osd=$2
@@ -310,21 +349,17 @@ calculate_scrub_settings() {
     local scrub_time=$4
     local scheduler=$5
 
-    # Defaults
-    local min_interval=86400    # 24h
-    local max_interval=604800   # 7d
-    local deep_interval=604800  # 7d
-    local max_scrubs=1
-    local randomize_ratio="0.5"
-    local load_threshold="0.5"
-    local scrub_sleep="0.0"
-    local begin_hour=1
-    local end_hour=7
+    local min_interval=86400 max_interval=604800 deep_interval=604800
+    local max_scrubs=1 randomize_ratio="0.5"
+    local load_threshold="0.5" scrub_sleep="0.0"
+    local begin_hour=1 end_hour=7
     local mclock_profile="balanced"
 
-    # Phase 0.1: osd_scrub_sleep is SECONDS (float), not microseconds.
-    # Phase 0.8: osd_scrub_load_threshold is loadavg/num_cpus.
-    #   Aggressive (low) values only when WPQ + --hyperconverged.
+    # Bucket → bucket-specific WPQ + mClock values.
+    # mClock profile choice (Phase 2.3 spec):
+    #   high_client_ops for read-heavy or hyperconverged;
+    #   balanced for write/mixed/archival;
+    #   high_recovery_ops is gated on Phase 6.1 (backlog drain).
     case "$workload_type" in
         1) # Heavy Read
             scrub_sleep="0.1"
@@ -335,7 +370,7 @@ calculate_scrub_settings() {
             scrub_sleep="0.2"
             if [ "$HYPERCONVERGED" -eq 1 ]; then load_threshold="0.2"; else load_threshold="0.5"; fi
             min_interval=172800
-            mclock_profile="high_client_ops"
+            mclock_profile="balanced"
             begin_hour=2; end_hour=5 ;;
         3) # Mixed
             scrub_sleep="0.1"
@@ -348,6 +383,9 @@ calculate_scrub_settings() {
             mclock_profile="balanced"
             begin_hour=0; end_hour=0 ;;
     esac
+
+    # Hyperconverged forces high_client_ops regardless of workload bucket.
+    [ "$HYPERCONVERGED" -eq 1 ] && mclock_profile="high_client_ops"
 
     # PG-density adjustment.
     if [ "$max_pgs_per_osd" -gt 200 ]; then
@@ -364,8 +402,7 @@ calculate_scrub_settings() {
         print_notice "Estimated deep-scrub time exceeds 3 days. Raising osd_max_scrubs." >&2
     fi
 
-    # Phase 0.3: cap max_scrubs and warn loudly. Default 2; allow 3 only
-    # with --aggressive-scrubs.
+    # Cap max_scrubs (Phase 0.3).
     local cap=2
     [ "$AGGRESSIVE_SCRUBS" -eq 1 ] && cap=3
     if [ "$max_scrubs" -gt "$cap" ]; then
@@ -380,22 +417,44 @@ calculate_scrub_settings() {
         print_warning "Verify your hosts can absorb that before applying." >&2
     fi
 
-    # Emit. Phase 0.4 includes osd_scrub_interval_randomize_ratio.
-    echo "osd_scrub_min_interval = $min_interval"
-    echo "osd_scrub_max_interval = $max_interval"
-    echo "osd_deep_scrub_interval = $deep_interval"
-    echo "osd_max_scrubs = $max_scrubs"
-    echo "osd_scrub_interval_randomize_ratio = $randomize_ratio"
-    echo "osd_scrub_begin_hour = $begin_hour"
-    echo "osd_scrub_end_hour = $end_hour"
+    local values="$min_interval,$max_interval,$deep_interval,$max_scrubs,$randomize_ratio,$begin_hour,$end_hour,$scrub_sleep,$load_threshold,$mclock_profile"
 
     if [ "$scheduler" = "mclock" ]; then
-        # Phase 0.7: mClock ignores sleep and load_threshold; emit a
-        # profile instead. Phase 2.3 will sharpen the choice.
-        echo "osd_mclock_profile = $mclock_profile"
+        emit_mclock_settings "$values"
     else
-        echo "osd_scrub_sleep = $scrub_sleep"
-        echo "osd_scrub_load_threshold = $load_threshold"
+        emit_wpq_settings "$values"
+    fi
+}
+
+# Phase 2.3: advisory for mClock benchmark when measured IOPS look low.
+# Default per-OSD baselines: 315 (HDD) / 21500 (SSD). Anything <10% of
+# the expected value suggests a bad benchmark run on OSD init.
+mclock_benchmark_advisory() {
+    [ "$SCHEDULER" != "mclock" ] && return 0
+    [ "$FROM_CLUSTER" -ne 1 ] && return 0
+    local hdd_iops="${current_osd_mclock_max_capacity_iops_hdd:-}"
+    local ssd_iops="${current_osd_mclock_max_capacity_iops_ssd:-}"
+    local flagged=0
+    if [ -n "$hdd_iops" ] && [ "$hdd_count" -gt 0 ]; then
+        # Compare floor(hdd_iops) against a low-water mark of 50.
+        local hi=${hdd_iops%.*}
+        if [ "${hi:-0}" -lt 50 ] 2>/dev/null; then
+            print_warning "mClock HDD benchmark reports $hdd_iops IOPS/OSD — suspiciously low."
+            flagged=1
+        fi
+    fi
+    if [ -n "$ssd_iops" ] && [ "$ssd_count$nvme_count" != "00" ]; then
+        local si=${ssd_iops%.*}
+        if [ "${si:-0}" -lt 5000 ] 2>/dev/null; then
+            print_warning "mClock SSD/NVMe benchmark reports $ssd_iops IOPS/OSD — suspiciously low."
+            flagged=1
+        fi
+    fi
+    if [ "$flagged" -eq 1 ]; then
+        echo "  Recommend re-running the benchmark:"
+        echo "    ceph config set osd osd_mclock_force_run_benchmark_on_init true"
+        echo "    # then restart OSDs one host at a time"
+        echo "    # then: ceph config set osd osd_mclock_force_run_benchmark_on_init false"
     fi
 }
 
@@ -640,6 +699,9 @@ ingest_current_config() {
     current_osd_scrub_end_hour=$(_cfg_lookup osd_scrub_end_hour)
     current_osd_scrub_interval_randomize_ratio=$(_cfg_lookup osd_scrub_interval_randomize_ratio)
     current_osd_mclock_profile=$(_cfg_lookup osd_mclock_profile)
+    # Phase 2.3: surface measured IOPS so the benchmark advisory can flag low values.
+    current_osd_mclock_max_capacity_iops_hdd=$(_cfg_lookup osd_mclock_max_capacity_iops_hdd)
+    current_osd_mclock_max_capacity_iops_ssd=$(_cfg_lookup osd_mclock_max_capacity_iops_ssd)
 }
 
 # Phase 1.7: scrub backlog summary. Counts PGs whose last_deep_scrub_stamp
@@ -716,6 +778,12 @@ prompt_workload() {
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+# Skip main when the script is sourced (e.g. by the unit-style smoke test
+# that calls emit_wpq_settings / emit_mclock_settings directly).
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || true
+fi
+
 parse_args "$@"
 load_device_profile
 
@@ -827,6 +895,8 @@ if [ "$SCHEDULER" = "mclock" ]; then
     echo "  References:"
     echo "    https://docs.ceph.com/en/reef/rados/configuration/mclock-config-ref/"
     echo "    https://www.clyso.com/blog/ceph-how-do-disable-mclock-scheduler/"
+    echo
+    mclock_benchmark_advisory
 else
     print_success "WPQ is active. All scrub knobs (sleep, load_threshold, intervals, ...) honored."
 fi
