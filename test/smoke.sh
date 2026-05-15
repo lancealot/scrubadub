@@ -229,5 +229,30 @@ check     "--diff without --from-cluster errors"    "$out" "--diff requires --fr
 [ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --diff without --from-cluster should exit non-zero"; fail=$((fail + 1)); }
 
 echo
+echo "Test 16: Phase 5.3-prep — --emit-backup-plan"
+PLAN=$(mktemp /tmp/scrubadub-backup-plan.XXXXXX.tsv)
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --emit-backup-plan "$PLAN" 2>&1)
+check     "writer confirms success"                  "$out" "Backup plan written to"
+check     "row count reported"                       "$out" "(11 rows)"
+plan_body=$(grep -v '^#' "$PLAN")
+check     "global osd row captures current value"    "$plan_body" "osd	osd		osd_deep_scrub_interval	1209600"
+check     "global row records current sleep"         "$plan_body" "osd	osd		osd_scrub_sleep	0.0"
+check     "per-class row records unset"              "$plan_body" "osd_class	osd	class:ssd	osd_scrub_sleep	<unset>"
+check     "per-pool row records unset"               "$plan_body" "pool	pool	rgw.buckets.index	deep_scrub_interval	<unset>"
+
+# Header block is self-describing.
+check     "backup file has restore comment"          "$(cat "$PLAN")" "scrubadub.sh --rollback"
+check     "backup file documents columns"            "$(cat "$PLAN")" "Columns (TAB-separated)"
+
+# --emit-backup-plan requires --from-cluster.
+set +e
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq --emit-backup-plan /tmp/sb-nope.tsv 2>&1); rc=$?
+set -e
+check     "--emit-backup-plan needs --from-cluster"  "$out" "requires --from-cluster"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --emit-backup-plan w/o --from-cluster should exit non-zero"; fail=$((fail + 1)); }
+
+rm -f "$PLAN" /tmp/sb-nope.tsv
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

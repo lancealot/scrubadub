@@ -64,6 +64,7 @@ WORKLOAD_TYPE=""   # 1/2/3/4; if set via --workload, skips the prompt
 # mutating modes are opt-in. DRY_RUN is the named form of today's default.
 DRY_RUN=1            # 0 only when --apply is given
 DIFF_ONLY=0          # --diff: emit just the delta and exit
+EMIT_BACKUP_PLAN=""  # --emit-backup-plan FILE: write backup plan, exit. Read-only.
 
 # Phase 3: honest performance model.
 NIC_GBPS=""          # --nic-gbps; per-host NIC speed in Gbps
@@ -146,6 +147,11 @@ Output modes (Phase 5):
                           intent-clarity in scripts.
   --diff                  Print only the current → proposed delta
                           (requires --from-cluster) and exit.
+  --emit-backup-plan FILE Write the would-rollback state to FILE as
+                          a TSV (one row per setting we'd change),
+                          then exit. Read-only — never touches cluster
+                          state. Requires --from-cluster. Useful for
+                          previewing the rollback format before --apply.
 
   -h, --help              Show this help.
 
@@ -226,6 +232,14 @@ parse_args() {
                 # --from-cluster and exit, skipping the full report.
                 DIFF_ONLY=1
                 shift ;;
+            --emit-backup-plan)
+                # Read the current state of every setting we'd change
+                # under --apply and write it to FILE as a TSV. Pure
+                # read-only; exits before any state mutation. Useful
+                # for verifying the rollback format on a live cluster.
+                require_value "$1" "${2:-}"
+                EMIT_BACKUP_PLAN="$2"
+                shift 2 ;;
             --device-profile)
                 require_value "$1" "${2:-}"
                 DEVICE_PROFILE="$2"
@@ -599,6 +613,14 @@ run_ceph() {
             "config get osd osd_op_queue")         fixture="osd_op_queue.txt" ;;
             "pg dump pgs_brief --format json")     fixture="pg_dump_pgs_brief.json" ;;
             "version")                              fixture="version.txt" ;;
+            "osd pool get "*" "*" --format json")
+                # Phase 5.3-prep: pool-get fixtures live at
+                # pool_get_<pool>_<key>.json. Missing file means "no
+                # override is set on that pool" — silently return
+                # non-zero so the caller's ENOENT path runs.
+                local args=($*)
+                fixture="pool_get_${args[3]}_${args[4]}.json"
+                [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
             *)
                 print_error "run_ceph: no fixture mapped for: ceph $*"
                 return 1 ;;
@@ -958,6 +980,77 @@ render_diff() {
     fi
 }
 
+# Phase 5.3-prep: build a backup plan from the proposed-change arrays.
+# Writes a self-describing TSV to $1. One row per setting we'd change.
+#
+# Row format: scope<TAB>section<TAB>mask<TAB>name<TAB>old_value
+#   scope:     "osd" | "osd_class" | "pool"
+#   section:   "osd" (config-set entity) or "pool" (no-op for pool rows)
+#   mask:      "" for globals, "class:<class>" for class overrides, "<pool>" for pool tuning
+#   old_value: current value as a string, or the literal "<unset>" if no override exists
+#
+# Read-only: only runs `ceph config dump` and `ceph osd pool get`. Never writes.
+build_backup_plan() {
+    local out_file=$1
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    {
+        echo "# scrubadub backup plan generated at $timestamp"
+        echo "# Restore with: scrubadub.sh --rollback $(basename "$out_file")"
+        echo "# Columns (TAB-separated):"
+        echo "#   scope     'osd' | 'osd_class' | 'pool'"
+        echo "#   section   'osd' (config-set entity) or 'pool' (pool tuning, ignored on rollback)"
+        echo "#   mask      empty for global, 'class:<class>' for per-class, '<pool>' for pool tuning"
+        echo "#   name      config key"
+        echo "#   old_value current value, or '<unset>' if no override existed pre-apply"
+    } > "$out_file"
+
+    local config_dump
+    config_dump=$(run_ceph config dump --format json) || exit 4
+
+    # 1. Global OSD config (proposed_settings entries: "key = value").
+    local setting name current
+    for setting in "${proposed_settings[@]}"; do
+        name="${setting% = *}"
+        current=$(echo "$config_dump" | jq -r --arg n "$name" '
+            [.[] | select(.section=="osd" and .name==$n and ((.mask // "")==""))][0].value // empty')
+        [ -z "$current" ] && current="<unset>"
+        printf "osd\tosd\t\t%s\t%s\n" "$name" "$current" >> "$out_file"
+    done
+
+    # 2. Per-class overrides (class_overrides entries: "osd/class:<class>|<key> = <value>").
+    local override entity kv mask
+    for override in "${class_overrides[@]}"; do
+        entity="${override%%|*}"
+        kv="${override#*|}"
+        name="${kv% = *}"
+        mask="${entity#osd/}"   # "class:ssd"
+        current=$(echo "$config_dump" | jq -r --arg n "$name" --arg m "$mask" '
+            [.[] | select(.section=="osd" and .name==$n and ((.mask // "")==$m))][0].value // empty')
+        [ -z "$current" ] && current="<unset>"
+        printf "osd_class\tosd\t%s\t%s\t%s\n" "$mask" "$name" "$current" >> "$out_file"
+    done
+
+    # 3. Per-pool tuning (pool_overrides entries: "<pool>#<key> = <value>").
+    # `ceph osd pool get` returns ENOENT-style errors when the override
+    # isn't set on the pool, so suppress stderr and treat empty as unset.
+    local pname pool_json
+    for override in "${pool_overrides[@]}"; do
+        pname="${override%%#*}"
+        kv="${override#*#}"
+        name="${kv% = *}"
+        pool_json=$(run_ceph osd pool get "$pname" "$name" --format json 2>/dev/null || true)
+        if [ -n "$pool_json" ]; then
+            current=$(echo "$pool_json" | jq -r --arg n "$name" '.[$n] // empty')
+        else
+            current=""
+        fi
+        [ -z "$current" ] && current="<unset>"
+        printf "pool\tpool\t%s\t%s\t%s\n" "$pname" "$name" "$current" >> "$out_file"
+    done
+}
+
 prompt_workload() {
     while true; do
         echo
@@ -1275,6 +1368,21 @@ fi
 if [ "$DIFF_EXIT_AFTER_OVERRIDES" -eq 1 ]; then
     echo
     print_notice "Diff-only mode — backup/apply/perf sections omitted. Re-run without --diff for full report."
+    exit 0
+fi
+
+# Phase 5.3-prep: --emit-backup-plan writes the would-rollback state
+# to a file and exits. Pure read-only; useful for inspecting the
+# format before --apply ever runs.
+if [ -n "$EMIT_BACKUP_PLAN" ]; then
+    if [ "$FROM_CLUSTER" -ne 1 ]; then
+        print_error "--emit-backup-plan requires --from-cluster (need real current state)."
+        exit 2
+    fi
+    build_backup_plan "$EMIT_BACKUP_PLAN"
+    plan_rowcount=$(grep -cv '^#' "$EMIT_BACKUP_PLAN" 2>/dev/null || echo 0)
+    print_success "Backup plan written to $EMIT_BACKUP_PLAN ($plan_rowcount rows)."
+    print_notice "Inspect with: cat $EMIT_BACKUP_PLAN"
     exit 0
 fi
 
