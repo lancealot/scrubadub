@@ -28,5 +28,27 @@
     "crush_rule": 2,
     "pg_num": 256,
     "erasure_code_profile": "ec-8-3"
+  },
+  {
+    "pool_name": "rgw.buckets.index",
+    "pool_id": 4,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "application_metadata": { "rgw": {} }
+  },
+  {
+    "pool_name": "paused-bulk",
+    "pool_id": 5,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 0,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "flags_names": "hashpspool,noscrub,nodeep-scrub"
   }
 ]

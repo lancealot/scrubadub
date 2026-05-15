@@ -465,6 +465,45 @@ calculate_scrub_settings() {
     fi
 }
 
+# Phase 4.1: per-class WPQ overrides. SSDs/NVMes don't need the same
+# throttle as HDDs; emit class-scoped overrides only when the cluster
+# has more than one device class and WPQ is active. mClock ignores
+# sleep/load_threshold per-class anyway, so this is a no-op under mClock.
+# Reads HDD_COUNT/SSD_COUNT/NVME_COUNT and the per-class cap from the
+# global flag context; appends "<entity>|<param> = <value>" rows to the
+# class_overrides array.
+compute_class_overrides() {
+    class_overrides=()
+    [ "$SCHEDULER" != "wpq" ] && return 0
+
+    # Count non-zero device classes; per-class only makes sense in mixed clusters.
+    local distinct=0
+    [ "$hdd_count" -gt 0 ]  && distinct=$((distinct + 1))
+    [ "$ssd_count" -gt 0 ]  && distinct=$((distinct + 1))
+    [ "$nvme_count" -gt 0 ] && distinct=$((distinct + 1))
+    [ "$distinct" -lt 2 ] && return 0
+
+    # The global emitter has already chosen an HDD-leaning sleep value;
+    # we override that for the faster classes. max_scrubs gets a bump
+    # for NVMe (only) and only when the user has opted into the higher
+    # cap via --aggressive-scrubs.
+    local base_scrubs
+    base_scrubs=$(printf '%s\n' "${proposed_settings[@]}" \
+        | awk -F' = ' '/^osd_max_scrubs/ { print $2 }')
+    : "${base_scrubs:=1}"
+
+    if [ "$ssd_count" -gt 0 ]; then
+        class_overrides+=("osd/class:ssd|osd_scrub_sleep = 0.0")
+    fi
+    if [ "$nvme_count" -gt 0 ]; then
+        class_overrides+=("osd/class:nvme|osd_scrub_sleep = 0.0")
+        if [ "$AGGRESSIVE_SCRUBS" -eq 1 ] && [ "$base_scrubs" -lt 3 ]; then
+            class_overrides+=("osd/class:nvme|osd_max_scrubs = $((base_scrubs + 1))")
+        fi
+    fi
+}
+
+
 # Phase 2.3: advisory for mClock benchmark when measured IOPS look low.
 # Default per-OSD baselines: 315 (HDD) / 21500 (SSD). Anything <10% of
 # the expected value suggests a bad benchmark run on OSD init.
@@ -737,6 +776,36 @@ ingest_pool_details() {
         DATA_FACTOR_DEN=$largest_factor_den
         DATA_FACTOR_SOURCE="largest pool '$largest_name' (${largest_factor_num}/${largest_factor_den})"
     fi
+
+    # Phase 4.2: walk pools again for per-pool overrides and footgun flags.
+    # Hot pools (small avg object size) want shorter deep-scrub intervals;
+    # the noscrub / nodeep-scrub pool flags are silent integrity killers.
+    pool_overrides=()
+    pool_warnings=()
+    local pool_row
+    # Non-whitespace separator: tab-IFS collapses empty fields, which
+    # mis-aligns rows whose `flags_names` is null.
+    while IFS='|' read -r pname stored objects flags is_hot; do
+        [ -z "$pname" ] && continue
+        if [[ "$flags" == *noscrub* ]] || [[ "$flags" == *nodeep-scrub* ]]; then
+            pool_warnings+=("$pname: $flags  (scrubbing disabled by pool flag)")
+        fi
+        if [ "$is_hot" = "1" ]; then
+            # Tighten the deep-scrub interval to 3 days (259200s) — index /
+            # metadata pools want frequent integrity verification.
+            pool_overrides+=("$pname#deep_scrub_interval = 259200")
+        fi
+    done < <(echo "$pools" "$df" | jq -s -r '
+        .[0] as $pools | .[1] as $df
+        | $pools[] | . as $p
+        | ($df.pools[] | select(.id == $p.pool_id)) as $d
+        | ($d.stats.stored // 0) as $st
+        | ($d.stats.objects // 0) as $obj
+        | (($p.flags_names // "") | tostring) as $flags
+        | (if $obj > 0 and ($st / $obj) < 65536 and $st > 1048576
+             then "1" else "0" end) as $hot
+        | "\($p.pool_name)|\($st)|\($obj)|\($flags)|\($hot)"
+    ')
 
     print_notice "Pools: $row_count; total stored: $((total_stored / 1073741824)) GB; avg PG size: $AVG_PG_SIZE GB"
 }
@@ -1102,6 +1171,9 @@ while IFS= read -r line; do
     proposed_settings+=("$line")
 done < <(calculate_scrub_settings "$total_osds" "$max_pg_per_osd" "$WORKLOAD_TYPE" "$estimated_scrub_time" "$SCHEDULER")
 
+# Phase 4.1: per-class WPQ overrides (no-op outside WPQ or single-class).
+compute_class_overrides
+
 # Phase 1.7: backlog summary in cluster mode.
 if [ "$FROM_CLUSTER" -eq 1 ] && [ -n "$backlog_summary" ]; then
     print_header "Scrub Backlog (from 'ceph pg dump pgs_brief')"
@@ -1114,6 +1186,32 @@ if [ "$FROM_CLUSTER" -eq 1 ]; then
     printf '%s\n' "${proposed_settings[@]}" | render_diff
 fi
 
+# Phase 4.1: per-class WPQ overrides section.
+if [ "${#class_overrides[@]}" -gt 0 ]; then
+    print_header "Per-class scheduler overrides (WPQ)"
+    echo "Faster device classes don't need the same throttle as HDDs."
+    for override in "${class_overrides[@]}"; do
+        entity="${override%%|*}"
+        kv="${override#*|}"
+        printf "  %-24s %s\n" "$entity" "$kv"
+    done
+fi
+
+# Phase 4.2: per-pool overrides and footgun warnings.
+if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
+    print_header "Per-pool overrides"
+    for warning in "${pool_warnings[@]}"; do
+        print_warning "Pool $warning"
+        echo "    To re-enable: ceph osd pool unset ${warning%%:*} noscrub"
+        echo "                  ceph osd pool unset ${warning%%:*} nodeep-scrub"
+    done
+    for override in "${pool_overrides[@]}"; do
+        pname="${override%%#*}"
+        kv="${override#*#}"
+        printf "  %-24s %s  (small avg object size → tighten scrub cadence)\n" "$pname" "$kv"
+    done
+fi
+
 print_header "Current Configuration Backup Commands"
 echo "# Run these on your cluster to back up the current settings:"
 echo "ceph config dump | grep -E 'scrub|osd_max_scrubs|osd_mclock_profile|osd_op_queue' \\"
@@ -1123,6 +1221,20 @@ print_header "Recommended Configuration Commands"
 echo "# Run these on your cluster to apply the recommended settings:"
 for setting in "${proposed_settings[@]}"; do
     echo "ceph config set osd ${setting// = / }"
+done
+# Phase 4.1: per-class overrides (entity is osd/class:<class>).
+for override in "${class_overrides[@]}"; do
+    entity="${override%%|*}"
+    kv="${override#*|}"
+    echo "ceph config set $entity ${kv// = / }"
+done
+# Phase 4.2: per-pool overrides (use 'ceph osd pool set', not 'config set').
+for override in "${pool_overrides[@]}"; do
+    pname="${override%%#*}"
+    kv="${override#*#}"
+    param="${kv% = *}"
+    value="${kv#* = }"
+    echo "ceph osd pool set $pname $param $value"
 done
 
 print_header "Performance Impact Analysis"

@@ -113,7 +113,7 @@ echo "Test 7: Phase 3 — network ceiling"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 2>&1)
 check     "1 GbE × 3 hosts → 375 MB/s ceiling"  "$out" "Network ceiling:     375 MB/s"
 check     "binding ceiling shows network-bound" "$out" "network-bound"
-check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~336 hours"
+check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~324 hours"
 
 # No --nic-gbps in prompt mode → no network ceiling
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
@@ -142,6 +142,31 @@ check     "concurrency warning > 8 fires" "$out" "high. On busy hosts"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 --aggressive-scrubs 2>&1)
 check     "concurrency line shown at 8"   "$out" "8 simultaneous scrubs"
 check_not "no warning at exactly 8"       "$out" "On busy hosts"
+
+echo
+echo "Test 11: Phase 4.1 — per-class WPQ overrides"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "per-class section appears (WPQ + mixed classes)" "$out" "Per-class scheduler overrides"
+check     "SSD sleep override emitted"                       "$out" "osd/class:ssd            osd_scrub_sleep = 0.0"
+check     "apply line uses osd/class:ssd entity"             "$out" "ceph config set osd/class:ssd osd_scrub_sleep 0.0"
+
+# mClock should skip per-class entirely (sleep is ignored under mClock).
+out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check_not "mClock skips per-class section"                   "$out" "Per-class scheduler overrides"
+
+echo
+echo "Test 12: Phase 4.2 — per-pool overrides and noscrub warnings"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "per-pool section appears"                         "$out" "Per-pool overrides"
+check     "noscrub flag warning fires"                       "$out" "Pool paused-bulk: hashpspool,noscrub,nodeep-scrub"
+check     "unset command emitted for noscrub"                "$out" "ceph osd pool unset paused-bulk noscrub"
+check     "unset command emitted for nodeep-scrub"           "$out" "ceph osd pool unset paused-bulk nodeep-scrub"
+check     "hot pool deep_scrub_interval override"            "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
+check     "apply line uses pool set syntax"                  "$out" "ceph osd pool set rgw.buckets.index deep_scrub_interval 259200"
+
+# Prompt mode has no pool data so no per-pool section.
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
+check_not "prompt mode skips per-pool section"               "$out" "Per-pool overrides"
 
 echo
 echo "Results: $pass passed, $fail failed"

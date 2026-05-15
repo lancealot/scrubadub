@@ -325,6 +325,49 @@ If you need to tighten further, Squid+ has `osd_scrub_max_concurrent_per_host`;
 on older releases the practical equivalent is `osd_max_scrubs=1` plus
 a tight `osd_scrub_begin_hour`/`osd_scrub_end_hour` window.
 
+## Per-class and per-pool overrides
+
+Beyond the global `osd_*` settings, scrubadub emits two extra kinds of
+recommendation when the cluster has the right shape.
+
+### Per-class WPQ overrides (`--from-cluster` + WPQ + mixed classes)
+
+The global `osd_scrub_sleep` is HDD-leaning by default (HDDs need
+pacing; NVMes don't). When the cluster has more than one device class
+and the active scheduler is WPQ, scrubadub adds a `Per-class scheduler
+overrides` section that emits class-scoped `osd/class:<class>` lines
+for the faster classes:
+
+```
+ceph config set osd/class:ssd  osd_scrub_sleep 0.0
+ceph config set osd/class:nvme osd_scrub_sleep 0.0
+```
+
+Under `--aggressive-scrubs`, NVMe also gets `osd_max_scrubs+1` (still
+capped at 3 globally).
+
+This section is skipped under mClock — mClock ignores
+`osd_scrub_sleep` and `osd_scrub_load_threshold` per-class anyway.
+
+### Per-pool overrides (`--from-cluster`)
+
+Two patterns trigger pool-level recommendations:
+
+- **`noscrub` / `nodeep-scrub` flag set on a pool.** This is a silent
+  integrity killer — scrubs simply don't run on that pool, regardless
+  of how the OSD scrub config looks. scrubadub flags it with the
+  `ceph osd pool unset` commands needed to re-enable scrubbing.
+- **Hot / index pools.** When average object size for a pool is under
+  64 KB (typical of RGW index pools, RBD metadata pools, omap-heavy
+  workloads), scrubadub emits a `deep_scrub_interval = 259200`
+  (3-day) override via `ceph osd pool set <pool> deep_scrub_interval`.
+  Index pools want frequent integrity verification because the
+  consequences of bit-rot are immediate and silent.
+
+Both per-class and per-pool sections appear only when the cluster
+matches the relevant shape — they're skipped on single-class clusters
+and in prompt mode (which has no pool data).
+
 ## Best Practices
 
 ### Before Applying Changes

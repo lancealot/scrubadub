@@ -33,9 +33,21 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1.4)
+## Current baseline (v1.5)
 
-After Phase 0, Phase 1, Phase 2, and Phase 3:
+After Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4:
+
+Per-class and per-pool overrides (Phase 4):
+- Mixed-class clusters under WPQ get `osd/class:<class>` overrides for
+  faster device classes (`osd_scrub_sleep = 0.0` for SSD/NVMe,
+  optional `osd_max_scrubs+1` on NVMe under `--aggressive-scrubs`).
+  Skipped under mClock (which ignores sleep/load_threshold per-class).
+- `--from-cluster` now flags pools with `noscrub` or `nodeep-scrub`
+  set, with the `ceph osd pool unset` commands to clear them.
+- Hot pools (avg object size < 64 KB) get a tightened
+  `deep_scrub_interval` (3 days) emitted as a `ceph osd pool set`
+  override. Indexes / metadata pools should verify integrity more
+  often than bulk RBD/EC pools.
 
 Honest performance model (Phase 3):
 - Network ceiling: scrub-time math now uses
@@ -398,7 +410,7 @@ a per-host scrub cap if the cluster supports it.
 
 ## Phase 4 — Per-pool and per-device-class recommendations
 
-### `[ ]` 4.1 Emit `ceph config set osd/class:<class>` lines
+### `[x]` 4.1 Emit `ceph config set osd/class:<class>` lines
 **Why.** Sleep values appropriate for HDDs should not apply to NVMe
 OSDs; today the script tunes globally.
 **What.** Emit class-scoped config lines for `osd_scrub_sleep`,
@@ -407,7 +419,7 @@ mixed classes.
 **Accept.** Output shows `osd/class:hdd`, `osd/class:ssd`, etc., with
 appropriate values per class.
 
-### `[ ]` 4.2 Emit `ceph osd pool set <pool> ...`
+### `[x]` 4.2 Emit `ceph osd pool set <pool> ...`
 **Why.** Hot pools (RGW index, RBD headers) and cold bulk pools
 need different scrub behavior.
 **What.** Identify hot vs cold pools from `ceph df detail`

@@ -37,6 +37,28 @@
         "bytes_used": 30236507645952,
         "percent_used": 0.114
       }
+    },
+    {
+      "name": "rgw.buckets.index",
+      "id": 4,
+      "stats": {
+        "stored": 8388608,
+        "objects": 131072,
+        "kb_used": 24576,
+        "bytes_used": 25165824,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "paused-bulk",
+      "id": 5,
+      "stats": {
+        "stored": 1073741824,
+        "objects": 256,
+        "kb_used": 3145728,
+        "bytes_used": 3221225472,
+        "percent_used": 0.0
+      }
     }
   ]
 }
