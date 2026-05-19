@@ -65,6 +65,7 @@ WORKLOAD_TYPE=""   # 1/2/3/4; if set via --workload, skips the prompt
 DRY_RUN=1            # 0 only when --apply is given
 DIFF_ONLY=0          # --diff: emit just the delta and exit
 EMIT_BACKUP_PLAN=""  # --emit-backup-plan FILE: write backup plan, exit. Read-only.
+SHOW_WHY=0           # --why: add a "Reasoning" section after the diff
 
 # Phase 3: honest performance model.
 NIC_GBPS=""          # --nic-gbps; per-host NIC speed in Gbps
@@ -129,7 +130,7 @@ Cluster-ingested mode (Phase 1):
   --workload {read|write|mixed|archive}
                           Skip the workload prompt by declaring up front.
 
-Performance model (Phase 3):
+Performance model:
   --nic-gbps N            Per-host NIC speed in Gbps. Caps the scrub
                           throughput estimate at hosts × NIC_GBPS.
                           Auto-detected via 'ethtool' under --from-cluster.
@@ -138,7 +139,7 @@ Performance model (Phase 3):
   --osds-per-host N       Max OSDs per host, for the per-host scrub
                           concurrency warning in prompt mode.
 
-Empirical throughput (Phase 3.5):
+Empirical throughput:
   --bench-osds            Measure per-OSD throughput by running
                           'ceph tell osd.X bench' on one OSD per host
                           per device class. Writes ~1 GiB per HDD
@@ -171,7 +172,7 @@ Tuning options:
                           OpenStack co-located VMs, etc.). Allows lower
                           osd_scrub_load_threshold values under WPQ.
   --aggressive-scrubs     Permit osd_max_scrubs up to 3 (default cap: 2).
-                          Read ROADMAP Phase 0.3 first.
+                          Verify per-host headroom before using.
   --scrub-budget-percent N
                           Integer 1-100. Share of the binding ceiling
                           (min of disk/network) reserved for scrub.
@@ -181,7 +182,7 @@ Tuning options:
                           Keys: HDD_THROUGHPUT, HDD_IOPS, SSD_THROUGHPUT,
                           SSD_IOPS, NVME_THROUGHPUT, NVME_IOPS.
 
-Output modes (Phase 5):
+Output modes:
   --dry-run               Print the full report without modifying the
                           cluster. This is the default; the flag is for
                           intent-clarity in scripts.
@@ -192,6 +193,8 @@ Output modes (Phase 5):
                           then exit. Read-only — never touches cluster
                           state. Requires --from-cluster. Useful for
                           previewing the rollback format before --apply.
+  --why                   Print a "Reasoning" section explaining each
+                          proposed parameter change.
 
   -h, --help              Show this help.
 
@@ -280,6 +283,11 @@ parse_args() {
                 require_value "$1" "${2:-}"
                 EMIT_BACKUP_PLAN="$2"
                 shift 2 ;;
+            --why)
+                # Print a "Reasoning" section after the proposed-changes
+                # diff, explaining each parameter recommendation.
+                SHOW_WHY=1
+                shift ;;
             --bench-osds)
                 BENCH_OSDS=1
                 shift ;;
@@ -1212,7 +1220,7 @@ load_or_run_benchmarks() {
     if load_bench_cache; then
         print_notice "Loaded bench cache from $BENCH_CACHE_FILE"
     else
-        print_header "Running per-OSD benchmarks (Phase 3.5)"
+        print_header "Running per-OSD benchmarks"
         echo "Sampling one OSD per host per device class. Each HDD bench writes"
         echo "~1 GiB; each NVMe bench writes ~2 GiB (Ceph caps it at 3 GiB). Run serially to avoid"
         echo "measuring cluster contention. Ctrl-C to stop launching new benches"
@@ -1488,7 +1496,7 @@ render_diff() {
         local proposed="${line#* = }"
         local current_var="current_${param}"
         local current="${!current_var:-(unset)}"
-        if [ "$current" = "$proposed" ]; then
+        if _values_equal "$current" "$proposed"; then
             printf "  %-42s %s (no change)\n" "$param:" "$current"
         else
             printf "  %-42s ${YELLOW}%s → %s${NC}\n" "$param:" "$current" "$proposed"
@@ -1501,6 +1509,132 @@ render_diff() {
     else
         print_notice "$changes parameter(s) would change. Backup before applying."
     fi
+}
+
+# --why: human-readable explanation per parameter. Called with the
+# parameter name + proposed value; echoes a 1-4-line explanation.
+# When the cluster's current value is interesting (silly defaults,
+# obvious misconfig), we name it in the reasoning.
+_explain_param() {
+    local param=$1 proposed=$2
+    local current_var="current_${param}"
+    local current="${!current_var:-(unset)}"
+    case "$param" in
+        osd_scrub_min_interval)
+            echo "Lower bound for shallow-scrub eligibility. Below this many seconds since"
+            echo "the last shallow scrub, a PG is not eligible to be re-scrubbed."
+            ;;
+        osd_scrub_max_interval)
+            echo "Hard upper bound for shallow-scrub eligibility. After this many seconds,"
+            echo "scrubs become forced regardless of cluster load."
+            ;;
+        osd_deep_scrub_interval)
+            echo "How often each PG gets a full data-integrity deep-scrub. Default 7d on"
+            echo "modern Ceph; 28d (your current value) is permissive and lets bit-rot"
+            echo "go undetected longer than most operators expect."
+            ;;
+        osd_max_scrubs)
+            echo "Number of PG scrubs an OSD will run concurrently. Higher = faster scrub"
+            echo "completion but more client-IO impact. With $proposed × OSDs_per_host"
+            echo "simultaneous scrubs per host, verify hosts can absorb the load."
+            ;;
+        osd_scrub_interval_randomize_ratio)
+            local extra=""
+            if [[ "$current" =~ ^[0-9.]+$ ]] && awk "BEGIN { exit !($current > 1.0) }"; then
+                extra="Your current value ($current) is above the valid maximum of 1.0 and"
+                extra="$extra is likely the dominant cause of scrub backlog: at this ratio,"
+                extra="$extra individual PGs can be deferred for up to $current × min_interval."
+            fi
+            echo "Spreads PG scrub eligibility within [interval, interval × (1 + ratio)] to"
+            echo "prevent synchronized scrub storms. Default 0.5; valid range 0.0-1.0."
+            [ -n "$extra" ] && { echo "$extra"; }
+            ;;
+        osd_scrub_begin_hour|osd_scrub_end_hour)
+            echo "Active scrub window (hours, 24h clock). 0-0 means scrub anytime."
+            echo "Restricting to off-peak hours reduces client-IO impact."
+            ;;
+        osd_scrub_sleep)
+            echo "Pause (seconds, float) between scrub-chunk reads. Higher = lower scrub"
+            echo "throughput but better client-IO isolation. HDD-leaning at $proposed; the"
+            echo "per-class override sets 0.0 for faster classes that don't need pacing."
+            echo "mClock ignores this knob — it's WPQ-only."
+            ;;
+        osd_scrub_load_threshold)
+            echo "Pause new scrubs when (loadavg / num_cpus) exceeds this value. A 16-core"
+            echo "host with threshold 0.5 stops launching new scrubs when loadavg > 8."
+            echo "Already-running scrubs continue. mClock ignores this — WPQ-only."
+            ;;
+        osd_mclock_profile)
+            echo "mClock QoS profile. 'high_client_ops' favors client latency over scrub;"
+            echo "'balanced' shares roughly evenly; 'high_recovery_ops' prioritizes recovery"
+            echo "and scrub over client. The profile is the main lever under mClock —"
+            echo "individual sleep/load knobs are ignored."
+            ;;
+        *)
+            echo "(no explanation registered for $param)"
+            ;;
+    esac
+}
+
+# Print the "Reasoning" section. Called when --why is given and we
+# have proposed_settings + class/pool override arrays in scope.
+render_why() {
+    print_header "Reasoning"
+    local first=1
+    local line param proposed current_var current
+    for line in "${proposed_settings[@]}"; do
+        param="${line% = *}"
+        proposed="${line#* = }"
+        current_var="current_${param}"
+        current="${!current_var:-(unset)}"
+        # Skip no-op rows — they're not changes.
+        _values_equal "$current" "$proposed" && continue
+        [ "$first" -eq 0 ] && echo
+        first=0
+        printf "${BOLD}%s = %s${NC}\n" "$param" "$proposed"
+        _explain_param "$param" "$proposed" | sed 's/^/  /'
+    done
+    if [ "${#class_overrides[@]}" -gt 0 ]; then
+        for line in "${class_overrides[@]}"; do
+            local entity="${line%%|*}"
+            local kv="${line#*|}"
+            local p="${kv% = *}"
+            local v="${kv#* = }"
+            echo
+            printf "${BOLD}%s %s = %s${NC}\n" "$entity" "$p" "$v"
+            echo "  Per-class override. Faster device classes don't need the global"
+            echo "  HDD-leaning sleep value; this lifts the throttle for $entity."
+        done
+    fi
+    if [ "${#pool_overrides[@]}" -gt 0 ]; then
+        for line in "${pool_overrides[@]}"; do
+            local pname="${line%%#*}"
+            local kv="${line#*#}"
+            local p="${kv% = *}"
+            local v="${kv#* = }"
+            echo
+            printf "${BOLD}pool/%s %s = %s${NC}\n" "$pname" "$p" "$v"
+            echo "  Hot pool (small avg object size — typical of RGW indexes, RBD metadata)."
+            echo "  Tightening deep_scrub_interval to 3 days verifies integrity more often;"
+            echo "  bit-rot on metadata has outsized impact compared to bulk-data pools."
+        done
+    fi
+}
+
+# Compare two scrub-config values for equivalence, handling the Ceph
+# habit of serializing seconds-typed values as "604800.000000". Strings
+# that parse as the same number are equal; otherwise fall back to
+# literal string equality (covers the "(unset)" sentinel).
+_values_equal() {
+    local a=$1 b=$2
+    [ "$a" = "$b" ] && return 0
+    [ "$a" = "(unset)" ] || [ "$b" = "(unset)" ] && return 1
+    # Both look numeric? Compare as awk floats.
+    if [[ "$a" =~ ^[0-9.]+$ ]] && [[ "$b" =~ ^[0-9.]+$ ]]; then
+        awk -v a="$a" -v b="$b" 'BEGIN { exit !(a + 0 == b + 0) }'
+        return $?
+    fi
+    return 1
 }
 
 # Phase 5.3-prep: build a backup plan from the proposed-change arrays.
@@ -1916,6 +2050,10 @@ if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
     done
 fi
 
+# --why: print the Reasoning section after the diff and overrides
+# but before backup/apply. Useful in both default and --diff modes.
+[ "$SHOW_WHY" -eq 1 ] && render_why
+
 # Phase 5.2: under --diff, stop here. The operator wanted just the delta.
 if [ "$DIFF_EXIT_AFTER_OVERRIDES" -eq 1 ]; then
     echo
@@ -1980,7 +2118,7 @@ if [ "$estimated_scrub_time" -gt "$deep_iv_h" ]; then
     print_warning "Estimated deep-scrub time (${estimated_scrub_time} h / ${est_days} d) exceeds your"
     print_warning "  current osd_deep_scrub_interval (${deep_iv_h} h). Backlog will grow."
     echo "  Recommendations:"
-    echo "    1. Verify --avg-pg-size-gb matches reality (Phase 1.4 computes it under --from-cluster)."
+    echo "    1. Verify --avg-pg-size-gb matches reality (computed automatically under --from-cluster)."
     echo "    2. Verify --replica-size / --ec-ratio matches your largest pool's overhead."
     echo "    3. Consider --aggressive-scrubs after verifying per-host headroom."
     echo "    4. Review PG distribution; rebalance if uneven."
@@ -2019,7 +2157,7 @@ echo "  1. Active scrub window: ${display_begin}:00–${display_end}:00 (0–0 m
 echo "  2. osd_scrub_load_threshold is normalized: loadavg / num_cpus. A 16-core"
 echo "     host with threshold 0.5 pauses scrubs when loadavg > 8."
 echo "  3. osd_scrub_sleep is in SECONDS (float). Old scrubadub docs said"
-echo "     microseconds; that was wrong. See ROADMAP Phase 0.1."
+echo "     microseconds; that was wrong."
 echo "  4. Scrub-time estimate assumes ${SCRUB_BUDGET_PERCENT}% of the binding ceiling is"
 echo "     available to scrub (source: $SCRUB_BUDGET_SOURCE). Override with"
 echo "     --scrub-budget-percent N or the SCRUB_BUDGET_PERCENT env var. This is"

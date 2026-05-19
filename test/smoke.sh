@@ -368,5 +368,27 @@ check     "--bench-osds needs --from-cluster"        "$out" "requires --from-clu
 rm -f "$CACHE"
 
 echo
+echo "Test 19: numeric diff comparison + --why"
+
+# 19a. Diff treats 86400.000000 == 86400 as no-change (formerly false positive).
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --diff 2>&1)
+check_not "no spurious 86400.000000 → 86400 row" "$out" "86400.000000 → 86400"
+check     "min_interval shown as no-change"      "$out" "osd_scrub_min_interval:                    86400 (no change)"
+
+# 19b. --why adds Reasoning section.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --why --diff 2>&1)
+check     "Reasoning section appears"            "$out" "=== Reasoning ==="
+check     "explains osd_deep_scrub_interval"     "$out" "How often each PG gets a full data-integrity deep-scrub"
+check     "explains osd_scrub_sleep"             "$out" "Pause (seconds, float) between scrub-chunk reads"
+check     "explains class override"              "$out" "Faster device classes don't need the global"
+check     "explains pool override"               "$out" "Hot pool (small avg object size"
+check_not "no-change params absent from why"     "$out" "Lower bound for shallow-scrub eligibility"
+
+# 19c. No "Phase" references in operator-facing output.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check_not "no 'Phase X.Y' in normal output"      "$out" "Phase 0."
+check_not "no 'Phase X.Y' in normal output 2"    "$out" "(Phase 3.5)"
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
