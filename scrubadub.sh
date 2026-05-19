@@ -847,19 +847,31 @@ select_bench_osds() {
     '
 }
 
-# Run `ceph tell osd.<id> bench` and parse bytes_per_sec on stdout. Empty on failure.
+# Run `ceph tell osd.<id> bench` and parse bytes_per_sec on stdout. Empty on
+# failure (and the reason printed to stderr for the operator to see).
 # Bench writes `total` bytes in `blocksize` chunks. Defaults match the Ceph CLI:
 #   total=1073741824 (1 GiB), blocksize=4194304 (4 MiB).
-# Caveat: there is NO abort facility on the Ceph side. If the caller is killed
-# mid-bench, the OSD will still complete the in-flight bench on its own.
+# `--format json` is REQUIRED — without it Ceph emits human-readable text
+# and jq returns nothing. Caveat: there is no abort facility on the Ceph
+# side; if the caller dies mid-bench, the OSD finishes on its own.
 bench_one_osd() {
     local osd_id=$1
     local total=${2:-1073741824}
     local blocksize=${3:-4194304}
-    local json
-    json=$(run_ceph tell "osd.$osd_id" bench "$total" "$blocksize" 2>/dev/null || true)
-    [ -z "$json" ] && return
-    echo "$json" | jq -r '.bytes_per_sec // empty' 2>/dev/null
+    local errfile="/tmp/scrubadub-bench-$$.err"
+    local out rc
+    out=$(run_ceph tell "osd.$osd_id" bench "$total" "$blocksize" --format json 2>"$errfile")
+    rc=$?
+    if [ $rc -ne 0 ] || [ -z "$out" ]; then
+        if [ -s "$errfile" ]; then
+            echo
+            head -1 "$errfile" | sed 's/^/    error: /' >&2
+        fi
+        rm -f "$errfile"
+        return 1
+    fi
+    rm -f "$errfile"
+    echo "$out" | jq -r '.bytes_per_sec // empty' 2>/dev/null
 }
 
 # Aggregate a list of numbers (one per line on stdin) using $1 method.
@@ -1825,8 +1837,12 @@ print_header "Performance Impact Analysis"
 # Phase 3.3: compare each estimate to its own configured interval.
 # Defaults: max_interval=7d (168h), deep_interval=7d. In cluster mode we
 # read whatever is actually configured.
-deep_iv_h=$(( (${current_osd_deep_scrub_interval:-604800}) / 3600 ))
-shallow_iv_h=$(( (${current_osd_scrub_max_interval:-604800}) / 3600 ))
+# Strip the .000000 Ceph appends to seconds-typed config values; bash
+# arithmetic errors on floats. Same fix as in ingest_scrub_backlog.
+_deep_iv_raw="${current_osd_deep_scrub_interval:-604800}"
+_shallow_iv_raw="${current_osd_scrub_max_interval:-604800}"
+deep_iv_h=$(( ${_deep_iv_raw%.*} / 3600 ))
+shallow_iv_h=$(( ${_shallow_iv_raw%.*} / 3600 ))
 
 echo "Deep scrub:"
 if [ "$estimated_scrub_time" -gt "$deep_iv_h" ]; then
