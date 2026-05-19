@@ -297,5 +297,75 @@ check_not "old 'PGs:' label gone from per-class"      "$out" "  - PGs: 896"
 check     "ingest notice uses 'PG-OSD assignments'"   "$out" "PG-OSD assignments by class"
 
 echo
+echo "Test 18: Phase 3.5 — empirical bench"
+
+# Clean cache and run from scratch.
+CACHE=/tmp/sb-smoke-bench-cache.json
+rm -f "$CACHE"
+
+# 18a. First run: benches all 6 OSDs (1 per host per class).
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
+        --bench-osds --bench-cache-file "$CACHE" 2>&1)
+check     "selects one HDD per host"                 "$out" "benching osd.0 (hdd on host-a"
+check     "selects one HDD per host (b)"             "$out" "benching osd.4 (hdd on host-b"
+check     "selects one HDD per host (c)"             "$out" "benching osd.8 (hdd on host-c"
+check     "selects one SSD per host"                 "$out" "benching osd.3 (ssd on host-a"
+check     "throughput source switches to bench"      "$out" "source: median of 3 sampled, just now"
+check     "outlier osd.8 flagged at default 0.5x"    "$out" "HDD outliers below 0.5× baseline: osd.8 (80 MB/s)"
+check_not "no SSD outliers (all ~600 MB/s)"          "$out" "SSD outliers below"
+check     "cache file written"                       "$out" "Bench results cached to"
+
+# 18b. Second run hits the cache (no fresh benches launched).
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
+        --bench-osds --bench-cache-file "$CACHE" 2>&1)
+check     "second run loads from cache"              "$out" "Loaded bench cache"
+check_not "no benches launched on cache hit"         "$out" "benching osd."
+check     "outlier persisted in cache"               "$out" "HDD outliers below 0.5× baseline: osd.8"
+check     "source label says 'cache'"                "$out" "source: median of 3 sampled, cache "
+
+# 18c. --refresh-bench bypasses cache.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
+        --bench-osds --bench-cache-file "$CACHE" --refresh-bench 2>&1)
+check     "--refresh-bench re-runs benches"          "$out" "benching osd.0 (hdd"
+check_not "--refresh-bench doesn't load cache"       "$out" "Loaded bench cache"
+
+# 18d. --bench-aggregate p25 picks the slowest of the trio (80 MB/s for HDD).
+rm -f "$CACHE"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
+        --bench-osds --bench-cache-file "$CACHE" --bench-aggregate p25 2>&1)
+check     "p25 picks slow HDD as baseline"           "$out" "(80 MB/s/OSD, source: p25 of 3"
+# At p25 baseline 80 MB/s, threshold = 40 MB/s, nothing is below it.
+check_not "no outliers at p25 baseline"              "$out" "HDD outliers below"
+
+# 18e. --outlier-threshold tightens the rule.
+rm -f "$CACHE"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
+        --bench-osds --bench-cache-file "$CACHE" --outlier-threshold 0.95 2>&1)
+# At threshold 0.95 × median 200 = 190, the 80 MB/s HDD is still flagged.
+check     "tighter threshold still flags osd.8"      "$out" "HDD outliers below 0.95× baseline"
+
+# 18f. Validation.
+set +e
+out=$("$SB" --bench-aggregate bogus 2>&1); rc=$?
+set -e
+check     "rejects bogus aggregate"                  "$out" "must be p25, median, trimmed-mean, or mean"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: bad --bench-aggregate should exit non-zero"; fail=$((fail + 1)); }
+
+set +e
+out=$("$SB" --outlier-threshold 1.5 2>&1); rc=$?
+set -e
+check     "rejects threshold > 1.0"                  "$out" "must be a fraction in (0, 1]"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: bad --outlier-threshold should exit non-zero"; fail=$((fail + 1)); }
+
+# 18g. --bench-osds requires --from-cluster.
+set +e
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq --bench-osds 2>&1); rc=$?
+set -e
+check     "--bench-osds needs --from-cluster"        "$out" "requires --from-cluster"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --bench-osds without --from-cluster should exit non-zero"; fail=$((fail + 1)); }
+
+rm -f "$CACHE"
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

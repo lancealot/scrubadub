@@ -74,6 +74,27 @@ NIC_MBPS=0           # computed: NIC_GBPS * 125
 NIC_SOURCE=""        # "--nic-gbps", "ethtool", or empty
 NETWORK_CEILING=0    # computed: HOST_COUNT * NIC_MBPS, MB/s; 0 means unused
 
+# Phase 3.5: empirical per-class throughput from `ceph tell osd.X bench`.
+BENCH_OSDS=0                 # --bench-osds enables; default off (no I/O surprises)
+BENCH_AGGREGATE="median"     # p25 | median | trimmed-mean | mean
+OUTLIER_THRESHOLD="0.5"      # flag OSDs slower than this fraction × baseline
+REFRESH_BENCH=0              # --refresh-bench: skip cache, re-bench
+BENCH_CACHE_FILE=""          # --bench-cache-file FILE; default ~/.scrubadub/bench-<fsid>.json
+BENCH_MAX_AGE_DAYS=30        # cache TTL
+# Result globals, populated by load_or_run_benchmarks(). Empty when not benched.
+BENCH_HDD_MBPS=""
+BENCH_SSD_MBPS=""
+BENCH_NVME_MBPS=""
+declare -a BENCH_HDD_OUTLIERS=()
+declare -a BENCH_SSD_OUTLIERS=()
+declare -a BENCH_NVME_OUTLIERS=()
+BENCH_HDD_SOURCE=""          # e.g. "median of 30 sampled, cache 2026-05-15"
+BENCH_SSD_SOURCE=""
+BENCH_NVME_SOURCE=""
+BENCH_HDD_SAMPLE_COUNT=0
+BENCH_SSD_SAMPLE_COUNT=0
+BENCH_NVME_SAMPLE_COUNT=0
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -116,6 +137,25 @@ Performance model (Phase 3):
                           in prompt mode. Auto-detected under --from-cluster.
   --osds-per-host N       Max OSDs per host, for the per-host scrub
                           concurrency warning in prompt mode.
+
+Empirical throughput (Phase 3.5):
+  --bench-osds            Measure per-OSD throughput by running
+                          'ceph tell osd.X bench' on one OSD per host
+                          per device class. Writes ~1 GiB per HDD
+                          sample, ~4 GiB per NVMe sample. Runs serially
+                          to avoid measuring contention. Results
+                          cached for 30 days (override with
+                          --refresh-bench). Default cache location:
+                          ~/.scrubadub/bench-<cluster_fsid>.json.
+  --bench-aggregate {p25|median|trimmed-mean|mean}
+                          How to combine per-OSD samples into a class
+                          baseline. Default: median. P25 is
+                          appropriate for scrub-time math (slow OSDs
+                          bottleneck the round).
+  --outlier-threshold N   Flag OSDs whose bench result is below N ×
+                          the per-class baseline. Default 0.5.
+  --refresh-bench         Re-run benches even if cache is fresh.
+  --bench-cache-file PATH Override the default cache file location.
 
 Tuning options:
   --avg-pg-size-gb N      Average PG size in GB (default: 4 in prompt mode,
@@ -239,6 +279,30 @@ parse_args() {
                 # for verifying the rollback format on a live cluster.
                 require_value "$1" "${2:-}"
                 EMIT_BACKUP_PLAN="$2"
+                shift 2 ;;
+            --bench-osds)
+                BENCH_OSDS=1
+                shift ;;
+            --bench-aggregate)
+                require_value "$1" "${2:-}"
+                case "$2" in
+                    p25|median|trimmed-mean|mean) BENCH_AGGREGATE="$2" ;;
+                    *) print_error "--bench-aggregate must be p25, median, trimmed-mean, or mean"; exit 2 ;;
+                esac
+                shift 2 ;;
+            --outlier-threshold)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^0\.[0-9]+$|^1\.0$|^1$ ]]; then
+                    print_error "--outlier-threshold must be a fraction in (0, 1]"; exit 2
+                fi
+                OUTLIER_THRESHOLD="$2"
+                shift 2 ;;
+            --refresh-bench)
+                REFRESH_BENCH=1
+                shift ;;
+            --bench-cache-file)
+                require_value "$1" "${2:-}"
+                BENCH_CACHE_FILE="$2"
                 shift 2 ;;
             --device-profile)
                 require_value "$1" "${2:-}"
@@ -622,6 +686,17 @@ run_ceph() {
                 local args=($*)
                 fixture="pool_get_${args[3]}_${args[4]}.json"
                 [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
+            "tell osd."*" bench "*)
+                # Phase 3.5: bench fixtures live at bench_osd_<id>.json.
+                # Missing file silently returns non-zero so the caller
+                # can skip the sample.
+                local args=($*)
+                local osd_part="${args[1]}"   # "osd.5"
+                local osd_id="${osd_part#osd.}"
+                fixture="bench_osd_${osd_id}.json"
+                [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
+            "fsid")
+                fixture="fsid.txt" ;;
             "osd erasure-code-profile get "*" --format json")
                 # Phase 1.4 (live-cluster fix): EC profile fixtures
                 # live at ec_profile_<name>.json. Missing file silently
@@ -739,6 +814,273 @@ compute_network_ceiling() {
         NIC_MBPS=$(awk "BEGIN { printf \"%d\", $NIC_GBPS * 125 }")
         NETWORK_CEILING=$((HOST_COUNT * NIC_MBPS))
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Phase 3.5: empirical per-class throughput via `ceph tell osd.X bench`.
+# -----------------------------------------------------------------------------
+
+# Pick one OSD per host per device class. Skips OSDs that are down, and
+# skips OSDs that participate in any non-clean PG (so we don't bench an OSD
+# that's currently backfilling — would give an artificially low number).
+# Echoes lines: <osd_id>\t<device_class>\t<host>
+select_bench_osds() {
+    local tree
+    tree=$(run_ceph osd tree --format json) || return 1
+
+    # OSDs to skip: any OSD in the up_set of a non-active+clean PG.
+    local busy_osds
+    busy_osds=" $(run_ceph pg dump pgs_brief --format json 2>/dev/null | jq -r '
+        .pg_stats[]? | select(.state != "active+clean") | .up[]?
+    ' | sort -u | tr '\n' ' ') "
+
+    # One pass: walk hosts to build osd_id -> host map; then walk OSDs and
+    # emit (id, class, host) for each up OSD. awk picks first per (host, class).
+    echo "$tree" | jq -r '
+        ([.nodes[] | select(.type=="host") | .name as $h | .children[] | {(tostring): $h}] | add) as $osd_to_host
+        | .nodes[] | select(.type=="osd" and .status=="up")
+        | "\(.id)\t\(.device_class)\t\($osd_to_host[(.id|tostring)])"
+    ' | awk -v busy="$busy_osds" -F'\t' '
+        { if (index(busy, " " $1 " ")) next }
+        { key = $3 "|" $2 }
+        !(key in seen) { print; seen[key] = 1 }
+    '
+}
+
+# Run `ceph tell osd.<id> bench` and parse bytes_per_sec on stdout. Empty on failure.
+# Bench writes `total` bytes in `blocksize` chunks. Defaults match the Ceph CLI:
+#   total=1073741824 (1 GiB), blocksize=4194304 (4 MiB).
+# Caveat: there is NO abort facility on the Ceph side. If the caller is killed
+# mid-bench, the OSD will still complete the in-flight bench on its own.
+bench_one_osd() {
+    local osd_id=$1
+    local total=${2:-1073741824}
+    local blocksize=${3:-4194304}
+    local json
+    json=$(run_ceph tell "osd.$osd_id" bench "$total" "$blocksize" 2>/dev/null || true)
+    [ -z "$json" ] && return
+    echo "$json" | jq -r '.bytes_per_sec // empty' 2>/dev/null
+}
+
+# Aggregate a list of numbers (one per line on stdin) using $1 method.
+# Methods: p25 | median | trimmed-mean | mean.
+aggregate_bench() {
+    local method=$1
+    sort -n | awk -v method="$method" '
+        { values[NR] = $1 }
+        END {
+            n = NR
+            if (n == 0) exit
+            if (method == "median") {
+                if (n % 2) print values[int((n+1)/2)]
+                else printf "%.0f\n", (values[n/2] + values[n/2+1]) / 2
+            } else if (method == "p25") {
+                idx = int(n * 0.25); if (idx < 1) idx = 1
+                print values[idx]
+            } else if (method == "trimmed-mean") {
+                trim = int(n * 0.1)
+                sum = 0; count = 0
+                for (i = trim + 1; i <= n - trim; i++) { sum += values[i]; count++ }
+                if (count > 0) printf "%.0f\n", sum / count
+            } else if (method == "mean") {
+                sum = 0; for (i = 1; i <= n; i++) sum += values[i]
+                printf "%.0f\n", sum / n
+            }
+        }
+    '
+}
+
+# Resolve the default cache file path. Sets BENCH_CACHE_FILE if empty.
+resolve_bench_cache_path() {
+    [ -n "$BENCH_CACHE_FILE" ] && return
+    local fsid
+    fsid=$(run_ceph fsid 2>/dev/null | tr -d ' \n' || echo "unknown")
+    [ -z "$fsid" ] && fsid="unknown"
+    BENCH_CACHE_FILE="${HOME:-/tmp}/.scrubadub/bench-${fsid}.json"
+}
+
+# Load cached bench results. Sets BENCH_*_MBPS, BENCH_*_OUTLIERS, BENCH_*_SOURCE
+# if the cache exists and is fresher than BENCH_MAX_AGE_DAYS. Returns 0 on
+# successful load, non-zero otherwise.
+load_bench_cache() {
+    resolve_bench_cache_path
+    [ "$REFRESH_BENCH" -eq 1 ] && return 1
+    [ ! -r "$BENCH_CACHE_FILE" ] && return 1
+
+    # Reject stale caches.
+    local age_days now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$BENCH_CACHE_FILE" 2>/dev/null || echo 0)
+    age_days=$(( (now - mtime) / 86400 ))
+    if [ "$age_days" -gt "$BENCH_MAX_AGE_DAYS" ]; then
+        print_warning "Bench cache is $age_days days old (>$BENCH_MAX_AGE_DAYS); ignoring. Use --refresh-bench to re-run."
+        return 1
+    fi
+
+    local cache_date
+    cache_date=$(jq -r '.timestamp // empty' "$BENCH_CACHE_FILE" 2>/dev/null)
+    [ -z "$cache_date" ] && return 1
+
+    BENCH_HDD_MBPS=$(jq -r '.hdd.baseline_mbps // empty' "$BENCH_CACHE_FILE")
+    BENCH_SSD_MBPS=$(jq -r '.ssd.baseline_mbps // empty' "$BENCH_CACHE_FILE")
+    BENCH_NVME_MBPS=$(jq -r '.nvme.baseline_mbps // empty' "$BENCH_CACHE_FILE")
+    BENCH_HDD_SAMPLE_COUNT=$(jq -r '.hdd.sample_count // 0' "$BENCH_CACHE_FILE")
+    BENCH_SSD_SAMPLE_COUNT=$(jq -r '.ssd.sample_count // 0' "$BENCH_CACHE_FILE")
+    BENCH_NVME_SAMPLE_COUNT=$(jq -r '.nvme.sample_count // 0' "$BENCH_CACHE_FILE")
+
+    mapfile -t BENCH_HDD_OUTLIERS < <(jq -r '.hdd.outliers[]? // empty' "$BENCH_CACHE_FILE")
+    mapfile -t BENCH_SSD_OUTLIERS < <(jq -r '.ssd.outliers[]? // empty' "$BENCH_CACHE_FILE")
+    mapfile -t BENCH_NVME_OUTLIERS < <(jq -r '.nvme.outliers[]? // empty' "$BENCH_CACHE_FILE")
+
+    local agg
+    agg=$(jq -r '.aggregate // "median"' "$BENCH_CACHE_FILE")
+    [ -n "$BENCH_HDD_MBPS" ] && BENCH_HDD_SOURCE="$agg of $BENCH_HDD_SAMPLE_COUNT sampled, cache $cache_date"
+    [ -n "$BENCH_SSD_MBPS" ] && BENCH_SSD_SOURCE="$agg of $BENCH_SSD_SAMPLE_COUNT sampled, cache $cache_date"
+    [ -n "$BENCH_NVME_MBPS" ] && BENCH_NVME_SOURCE="$agg of $BENCH_NVME_SAMPLE_COUNT sampled, cache $cache_date"
+    return 0
+}
+
+# Save bench results (currently held in BENCH_*) to the cache file.
+save_bench_cache() {
+    resolve_bench_cache_path
+    local cache_dir
+    cache_dir=$(dirname "$BENCH_CACHE_FILE")
+    mkdir -p "$cache_dir" 2>/dev/null || true
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # Build JSON. Handle the outlier arrays carefully — they may be empty.
+    jq -n \
+        --arg ts "$now" \
+        --arg agg "$BENCH_AGGREGATE" \
+        --argjson hdd_b "${BENCH_HDD_MBPS:-null}" \
+        --argjson ssd_b "${BENCH_SSD_MBPS:-null}" \
+        --argjson nvme_b "${BENCH_NVME_MBPS:-null}" \
+        --argjson hdd_n "${BENCH_HDD_SAMPLE_COUNT:-0}" \
+        --argjson ssd_n "${BENCH_SSD_SAMPLE_COUNT:-0}" \
+        --argjson nvme_n "${BENCH_NVME_SAMPLE_COUNT:-0}" \
+        --argjson hdd_o "$(printf '%s\n' "${BENCH_HDD_OUTLIERS[@]}" | jq -R . | jq -s .)" \
+        --argjson ssd_o "$(printf '%s\n' "${BENCH_SSD_OUTLIERS[@]}" | jq -R . | jq -s .)" \
+        --argjson nvme_o "$(printf '%s\n' "${BENCH_NVME_OUTLIERS[@]}" | jq -R . | jq -s .)" \
+        '{
+            timestamp: $ts,
+            aggregate: $agg,
+            hdd:  { baseline_mbps: $hdd_b,  sample_count: $hdd_n,  outliers: ($hdd_o  | map(select(length > 0))) },
+            ssd:  { baseline_mbps: $ssd_b,  sample_count: $ssd_n,  outliers: ($ssd_o  | map(select(length > 0))) },
+            nvme: { baseline_mbps: $nvme_b, sample_count: $nvme_n, outliers: ($nvme_o | map(select(length > 0))) }
+        }' > "$BENCH_CACHE_FILE"
+    print_success "Bench results cached to $BENCH_CACHE_FILE"
+}
+
+# Run benches against the selected OSDs and populate result globals. Uses
+# a 4 GiB total for NVMe (small samples hit cache and report bogus numbers)
+# and 1 GiB for HDD. Traps SIGINT so Ctrl-C exits cleanly — the in-flight
+# bench will finish on the OSD side regardless.
+_bench_interrupted=0
+_bench_sigint_handler() {
+    _bench_interrupted=1
+    print_warning "Ctrl-C received — finishing current bench (no abort facility); skipping remaining samples."
+}
+run_benchmarks() {
+    local osd_list
+    osd_list=$(select_bench_osds) || { print_error "Couldn't select bench OSDs"; return 1; }
+    if [ -z "$osd_list" ]; then
+        print_warning "No bench-eligible OSDs found (all up+in OSDs are busy with non-clean PGs?)."
+        return 1
+    fi
+
+    local hdd_samples=() ssd_samples=() nvme_samples=()
+    local hdd_ids=() ssd_ids=() nvme_ids=()
+
+    trap _bench_sigint_handler INT
+
+    local osd_id osd_class host bytes_per_sec mbps total
+    local samples_attempted=0 samples_succeeded=0
+    while IFS=$'\t' read -r osd_id osd_class host; do
+        [ -z "$osd_id" ] && continue
+        [ "$_bench_interrupted" -eq 1 ] && break
+        samples_attempted=$((samples_attempted + 1))
+        case "$osd_class" in
+            nvme) total=4294967296 ;;   # 4 GiB
+            *)    total=1073741824 ;;   # 1 GiB
+        esac
+        printf "  benching osd.%s (%s on %s, ~%d GiB write)... " "$osd_id" "$osd_class" "$host" "$((total / 1073741824))"
+        bytes_per_sec=$(bench_one_osd "$osd_id" "$total")
+        if [ -z "$bytes_per_sec" ]; then
+            printf "FAILED\n"
+            continue
+        fi
+        mbps=$(awk "BEGIN { printf \"%d\", $bytes_per_sec / 1048576 }")
+        printf "%d MB/s\n" "$mbps"
+        samples_succeeded=$((samples_succeeded + 1))
+        case "$osd_class" in
+            hdd)  hdd_samples+=("$mbps");  hdd_ids+=("$osd_id") ;;
+            ssd)  ssd_samples+=("$mbps");  ssd_ids+=("$osd_id") ;;
+            nvme) nvme_samples+=("$mbps"); nvme_ids+=("$osd_id") ;;
+        esac
+    done <<< "$osd_list"
+    trap - INT
+
+    [ "$samples_succeeded" -eq 0 ] && { print_warning "All bench samples failed."; return 1; }
+
+    # Aggregate per class.
+    if [ "${#hdd_samples[@]}" -gt 0 ]; then
+        BENCH_HDD_MBPS=$(printf '%s\n' "${hdd_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
+        BENCH_HDD_SAMPLE_COUNT=${#hdd_samples[@]}
+        BENCH_HDD_SOURCE="$BENCH_AGGREGATE of $BENCH_HDD_SAMPLE_COUNT sampled, just now"
+        _flag_outliers BENCH_HDD_OUTLIERS hdd_samples hdd_ids "$BENCH_HDD_MBPS"
+    fi
+    if [ "${#ssd_samples[@]}" -gt 0 ]; then
+        BENCH_SSD_MBPS=$(printf '%s\n' "${ssd_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
+        BENCH_SSD_SAMPLE_COUNT=${#ssd_samples[@]}
+        BENCH_SSD_SOURCE="$BENCH_AGGREGATE of $BENCH_SSD_SAMPLE_COUNT sampled, just now"
+        _flag_outliers BENCH_SSD_OUTLIERS ssd_samples ssd_ids "$BENCH_SSD_MBPS"
+    fi
+    if [ "${#nvme_samples[@]}" -gt 0 ]; then
+        BENCH_NVME_MBPS=$(printf '%s\n' "${nvme_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
+        BENCH_NVME_SAMPLE_COUNT=${#nvme_samples[@]}
+        BENCH_NVME_SOURCE="$BENCH_AGGREGATE of $BENCH_NVME_SAMPLE_COUNT sampled, just now"
+        _flag_outliers BENCH_NVME_OUTLIERS nvme_samples nvme_ids "$BENCH_NVME_MBPS"
+    fi
+
+    save_bench_cache
+}
+
+# Helper: populate outlier list for one class. Args: out_array_name,
+# samples_array_name, ids_array_name, baseline.
+_flag_outliers() {
+    local out_name=$1 samples_name=$2 ids_name=$3 baseline=$4
+    local -n out_ref=$out_name
+    local -n samples_ref=$samples_name
+    local -n ids_ref=$ids_name
+    out_ref=()
+    local threshold_mbps
+    threshold_mbps=$(awk "BEGIN { printf \"%d\", $baseline * $OUTLIER_THRESHOLD }")
+    local i
+    for i in "${!samples_ref[@]}"; do
+        if [ "${samples_ref[$i]}" -lt "$threshold_mbps" ]; then
+            out_ref+=("osd.${ids_ref[$i]} (${samples_ref[$i]} MB/s)")
+        fi
+    done
+}
+
+# Top-level: load cache if fresh, else run benches. Called from main when
+# --bench-osds is set. Substitutes results into HDD_THROUGHPUT etc.
+load_or_run_benchmarks() {
+    if load_bench_cache; then
+        print_notice "Loaded bench cache from $BENCH_CACHE_FILE"
+    else
+        print_header "Running per-OSD benchmarks (Phase 3.5)"
+        echo "Sampling one OSD per host per device class. Each HDD bench writes"
+        echo "~1 GiB; each NVMe bench writes ~4 GiB. Run serially to avoid"
+        echo "measuring cluster contention. Ctrl-C to stop launching new benches"
+        echo "(the in-flight bench will finish on the OSD side — no abort exists)."
+        echo
+        run_benchmarks || return 1
+    fi
+
+    [ -n "$BENCH_HDD_MBPS" ]  && HDD_THROUGHPUT=$BENCH_HDD_MBPS
+    [ -n "$BENCH_SSD_MBPS" ]  && SSD_THROUGHPUT=$BENCH_SSD_MBPS
+    [ -n "$BENCH_NVME_MBPS" ] && NVME_THROUGHPUT=$BENCH_NVME_MBPS
 }
 
 # Phase 1.3: per-device-class PG counts + stddev/mean warning.
@@ -1232,6 +1574,17 @@ fi
 # Phase 3.1: derive network ceiling now that all inputs are in.
 compute_network_ceiling
 
+# Phase 3.5: empirical per-class throughput. Opt-in because it runs real
+# I/O against sampled OSDs (`ceph tell osd.X bench`). Replaces the
+# hardcoded HDD/SSD/NVMe THROUGHPUT defaults when results are available.
+if [ "$BENCH_OSDS" -eq 1 ]; then
+    if [ "$FROM_CLUSTER" -ne 1 ]; then
+        print_error "--bench-osds requires --from-cluster (need to talk to OSDs)."
+        exit 2
+    fi
+    load_or_run_benchmarks
+fi
+
 # Phase 3.2: substitute mClock-measured IOPS where the cluster has them.
 HDD_IOPS_SOURCE="default"
 SSD_IOPS_SOURCE="default"
@@ -1265,28 +1618,40 @@ if [ "$hdd_count" -gt 0 ]; then
     read -r hdd_tp hdd_io <<< "$(calculate_device_performance "$hdd_count" "$HDD_THROUGHPUT" "$HDD_IOPS")"
     total_throughput=$((total_throughput + hdd_tp))
     total_iops=$((total_iops + hdd_io))
+    hdd_tp_source="${BENCH_HDD_SOURCE:-default}"
     echo "HDD OSDs: $hdd_count"
     echo "  - PG replicas: $hdd_pg_count (avg $(calculate_pg_per_osd "$hdd_pg_count" "$hdd_count") per OSD)"
-    echo "  - Raw throughput: $hdd_tp MB/s (${HDD_THROUGHPUT} MB/s/OSD)"
+    echo "  - Throughput: $hdd_tp MB/s (${HDD_THROUGHPUT} MB/s/OSD, source: $hdd_tp_source)"
     echo "  - IOPS: $hdd_io (${HDD_IOPS}/OSD, source: $HDD_IOPS_SOURCE)"
+    if [ "${#BENCH_HDD_OUTLIERS[@]}" -gt 0 ]; then
+        print_warning "HDD outliers below ${OUTLIER_THRESHOLD}× baseline: ${BENCH_HDD_OUTLIERS[*]}"
+    fi
 fi
 if [ "$ssd_count" -gt 0 ]; then
     read -r ssd_tp ssd_io <<< "$(calculate_device_performance "$ssd_count" "$SSD_THROUGHPUT" "$SSD_IOPS")"
     total_throughput=$((total_throughput + ssd_tp))
     total_iops=$((total_iops + ssd_io))
+    ssd_tp_source="${BENCH_SSD_SOURCE:-default}"
     echo "SSD OSDs: $ssd_count"
     echo "  - PG replicas: $ssd_pg_count (avg $(calculate_pg_per_osd "$ssd_pg_count" "$ssd_count") per OSD)"
-    echo "  - Raw throughput: $ssd_tp MB/s (${SSD_THROUGHPUT} MB/s/OSD)"
+    echo "  - Throughput: $ssd_tp MB/s (${SSD_THROUGHPUT} MB/s/OSD, source: $ssd_tp_source)"
     echo "  - IOPS: $ssd_io (${SSD_IOPS}/OSD, source: $SSD_IOPS_SOURCE)"
+    if [ "${#BENCH_SSD_OUTLIERS[@]}" -gt 0 ]; then
+        print_warning "SSD outliers below ${OUTLIER_THRESHOLD}× baseline: ${BENCH_SSD_OUTLIERS[*]}"
+    fi
 fi
 if [ "$nvme_count" -gt 0 ]; then
     read -r nvme_tp nvme_io <<< "$(calculate_device_performance "$nvme_count" "$NVME_THROUGHPUT" "$NVME_IOPS")"
     total_throughput=$((total_throughput + nvme_tp))
     total_iops=$((total_iops + nvme_io))
+    nvme_tp_source="${BENCH_NVME_SOURCE:-default}"
     echo "NVMe OSDs: $nvme_count"
     echo "  - PG replicas: $nvme_pg_count (avg $(calculate_pg_per_osd "$nvme_pg_count" "$nvme_count") per OSD)"
-    echo "  - Raw throughput: $nvme_tp MB/s (${NVME_THROUGHPUT} MB/s/OSD)"
+    echo "  - Throughput: $nvme_tp MB/s (${NVME_THROUGHPUT} MB/s/OSD, source: $nvme_tp_source)"
     echo "  - IOPS: $nvme_io (${NVME_IOPS}/OSD, source: $NVME_IOPS_SOURCE)"
+    if [ "${#BENCH_NVME_OUTLIERS[@]}" -gt 0 ]; then
+        print_warning "NVMe outliers below ${OUTLIER_THRESHOLD}× baseline: ${BENCH_NVME_OUTLIERS[*]}"
+    fi
 fi
 
 echo

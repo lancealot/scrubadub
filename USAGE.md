@@ -326,6 +326,59 @@ fires (see the previous section) and the script keeps using whichever
 value is in `ceph config` — re-run the benchmark before relying on the
 estimate.
 
+### Empirical throughput (`--bench-osds`)
+
+The hardcoded throughput baselines (200 MB/s HDD, 500 MB/s SSD,
+3500 MB/s NVMe) are order-of-magnitude guesses for typical hardware
+and are usually wrong for any specific cluster — disks, controllers,
+NVMe generation, and bluestore tuning all matter. For a real number,
+opt in to `--bench-osds`.
+
+What it does:
+
+- Picks **one OSD per host per device class** from `ceph osd tree`,
+  skipping OSDs that are `down` or that participate in any non-clean
+  PG (so backfilling OSDs don't drag the sample).
+- Runs `ceph tell osd.<id> bench` against each sampled OSD. HDD
+  samples write 1 GiB; NVMe samples write 4 GiB (small samples on
+  NVMe live entirely in cache and report bogus high numbers).
+- Aggregates per-class results into a baseline via the method
+  chosen by `--bench-aggregate` (default: `median`).
+- Flags OSDs whose individual result is below
+  `--outlier-threshold × baseline` (default `0.5×`).
+- Caches everything to `~/.scrubadub/bench-<cluster_fsid>.json` for
+  30 days. Use `--refresh-bench` to re-run.
+
+Aggregation options:
+
+| Method | When to use |
+|---|---|
+| `median` (default) | Robust to one bad sample; matches operator intuition. |
+| `p25` | Honest for scrub-time math — scrub completes at the speed of the slowest OSDs, not the typical ones. |
+| `trimmed-mean` | Drops top and bottom 10% before averaging; balances stability and detail. |
+| `mean` | Simple average; vulnerable to outliers. |
+
+What it does NOT measure:
+
+- **Reads.** `ceph tell osd.X bench` writes data. Scrub reads data.
+  For HDDs these track closely; for NVMe, read is typically faster
+  than write, so the write-based baseline is **conservative** for
+  scrub-time estimates — good for safety, bad if you want an
+  optimistic number.
+- **Cluster contention.** Bench measures the OSD under whatever
+  load the cluster has at the moment. Run during low-traffic
+  periods if you care about peak capacity.
+- **Abort.** There is no abort facility in Ceph. If you Ctrl-C
+  scrubadub mid-bench, the in-flight bench on the OSD will finish
+  on its own. scrubadub stops launching new benches but can't
+  interrupt the one already running.
+
+In the analysis section, the throughput source is labelled
+`source: median of N sampled, just now` (fresh run) or
+`source: median of N sampled, cache <date>` (cache hit). Outliers
+get a yellow warning line listing the offending OSD IDs and their
+measured throughput.
+
 ### Per-host scrub concurrency
 
 scrubadub computes `proposed_osd_max_scrubs × max(OSDs_per_host)` and

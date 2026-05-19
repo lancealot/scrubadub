@@ -33,9 +33,23 @@ Ceph node anyway. No Python rewrite is planned.
 
 ---
 
-## Current baseline (v1.5)
+## Current baseline (v1.6)
 
-After Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4:
+After Phase 0, Phase 1, Phase 2, Phase 3, Phase 3.5, and Phase 4:
+
+Empirical throughput (Phase 3.5):
+- Opt-in `--bench-osds` runs `ceph tell osd.X bench` against one
+  OSD per host per device class, skipping down/backfilling OSDs.
+- Aggregation configurable: `median` (default), `p25`, `trimmed-mean`,
+  `mean`. P25 is appropriate for scrub-time math since the slowest
+  OSDs bottleneck the round.
+- Outliers flagged at `OUTLIER_THRESHOLD × baseline` (default 0.5×)
+  with their measured throughput in the warning.
+- Results cached to `~/.scrubadub/bench-<fsid>.json` with a 30-day
+  TTL; `--refresh-bench` forces re-bench.
+- Source label in the analysis section makes it clear which number
+  is in play: `source: default` vs `source: median of N sampled,
+  cache <date>`.
 
 Per-class and per-pool overrides (Phase 4):
 - Mixed-class clusters under WPQ get `osd/class:<class>` overrides for
@@ -405,6 +419,21 @@ itself isn't raising `osd_max_scrubs`.
 a per-host scrub cap if the cluster supports it.
 **Accept.** Warning fires on a 16-OSD-per-host fixture with default
 `osd_max_scrubs`.
+
+### `[x]` 3.5 Empirical per-class throughput via `ceph tell osd.X bench`
+**Why.** The hardcoded throughput baselines (200 / 500 / 3500 MB/s)
+are order-of-magnitude guesses, usually wrong for real hardware.
+mClock's self-benchmark only gives us IOPS, not throughput, and
+on WPQ clusters the mClock values may be absent entirely.
+**What.** Opt-in `--bench-osds` flag samples one OSD per host per
+device class via `ceph tell osd.X bench`, aggregates per class
+(median by default; p25 / trimmed-mean / mean configurable),
+flags slow OSDs as outliers, and caches results to
+`~/.scrubadub/bench-<fsid>.json` for 30 days. Skips OSDs in
+non-clean PGs so backfilling OSDs don't drag the sample.
+**Accept.** Source label in the analysis section changes from
+`default` to `median of N sampled, cache <date>` when benches
+have been run. Slow OSDs flagged with their measured throughput.
 
 ---
 
