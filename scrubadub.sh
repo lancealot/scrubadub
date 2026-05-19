@@ -142,7 +142,7 @@ Empirical throughput (Phase 3.5):
   --bench-osds            Measure per-OSD throughput by running
                           'ceph tell osd.X bench' on one OSD per host
                           per device class. Writes ~1 GiB per HDD
-                          sample, ~4 GiB per NVMe sample. Runs serially
+                          sample, ~2 GiB per NVMe sample. Runs serially
                           to avoid measuring contention. Results
                           cached for 30 days (override with
                           --refresh-bench). Default cache location:
@@ -852,16 +852,33 @@ select_bench_osds() {
 # Bench writes `total` bytes in `blocksize` chunks. Defaults match the Ceph CLI:
 #   total=1073741824 (1 GiB), blocksize=4194304 (4 MiB).
 # `--format json` is REQUIRED — without it Ceph emits human-readable text
-# and jq returns nothing. Caveat: there is no abort facility on the Ceph
-# side; if the caller dies mid-bench, the OSD finishes on its own.
+# and jq returns nothing.
+#
+# Ceph imposes a safety cap: count <= osd_bench_large_size_max_throughput
+# (100 MiB/s by default) × osd_bench_duration (30 s) = ~3 GiB for block
+# sizes >= 1 MiB. If we exceed it, we get EINVAL with the cap embedded in
+# the message; this function parses the cap and retries automatically.
+#
+# Caveat: there is no abort facility on the Ceph side; if the caller dies
+# mid-bench, the OSD finishes on its own.
 bench_one_osd() {
     local osd_id=$1
     local total=${2:-1073741824}
     local blocksize=${3:-4194304}
     local errfile="/tmp/scrubadub-bench-$$.err"
-    local out rc
+    local out rc cap
     out=$(run_ceph tell "osd.$osd_id" bench "$total" "$blocksize" --format json 2>"$errfile")
     rc=$?
+
+    # Auto-retry below the Ceph safety cap when EINVAL hits it.
+    if [ $rc -ne 0 ] && grep -q "'count' values greater than" "$errfile" 2>/dev/null; then
+        cap=$(grep -oE "greater than [0-9]+" "$errfile" | head -1 | awk '{print $3}')
+        if [ -n "$cap" ] && [ "$cap" -gt 0 ]; then
+            out=$(run_ceph tell "osd.$osd_id" bench "$cap" "$blocksize" --format json 2>"$errfile")
+            rc=$?
+        fi
+    fi
+
     if [ $rc -ne 0 ] || [ -z "$out" ]; then
         if [ -s "$errfile" ]; then
             echo
@@ -1012,7 +1029,7 @@ run_benchmarks() {
         [ "$_bench_interrupted" -eq 1 ] && break
         samples_attempted=$((samples_attempted + 1))
         case "$osd_class" in
-            nvme) total=4294967296 ;;   # 4 GiB
+            nvme) total=2147483648 ;;   # 2 GiB — stays under the default 3 GiB Ceph safety cap
             *)    total=1073741824 ;;   # 1 GiB
         esac
         printf "  benching osd.%s (%s on %s, ~%d GiB write)... " "$osd_id" "$osd_class" "$host" "$((total / 1073741824))"
@@ -1083,7 +1100,7 @@ load_or_run_benchmarks() {
     else
         print_header "Running per-OSD benchmarks (Phase 3.5)"
         echo "Sampling one OSD per host per device class. Each HDD bench writes"
-        echo "~1 GiB; each NVMe bench writes ~4 GiB. Run serially to avoid"
+        echo "~1 GiB; each NVMe bench writes ~2 GiB (Ceph caps it at 3 GiB). Run serially to avoid"
         echo "measuring cluster contention. Ctrl-C to stop launching new benches"
         echo "(the in-flight bench will finish on the OSD side — no abort exists)."
         echo
