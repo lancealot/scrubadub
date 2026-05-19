@@ -1015,69 +1015,177 @@ _bench_sigint_handler() {
     _bench_interrupted=1
     print_warning "Ctrl-C received — finishing current bench (no abort facility); skipping remaining samples."
 }
+# Per-class min/max/median + labels for the summary line. Empty when not benched.
+BENCH_HDD_MIN=""    BENCH_HDD_MAX=""    BENCH_HDD_MEDIAN=""    BENCH_HDD_MIN_LABEL=""    BENCH_HDD_MAX_LABEL=""
+BENCH_SSD_MIN=""    BENCH_SSD_MAX=""    BENCH_SSD_MEDIAN=""    BENCH_SSD_MIN_LABEL=""    BENCH_SSD_MAX_LABEL=""
+BENCH_NVME_MIN=""   BENCH_NVME_MAX=""   BENCH_NVME_MEDIAN=""   BENCH_NVME_MIN_LABEL=""   BENCH_NVME_MAX_LABEL=""
+
+# Accumulated across classes; surfaced at end of run_benchmarks.
+declare -a BENCH_ERRORS=()
+
 run_benchmarks() {
     local osd_list
     osd_list=$(select_bench_osds) || { print_error "Couldn't select bench OSDs"; return 1; }
     if [ -z "$osd_list" ]; then
-        print_warning "No bench-eligible OSDs found (all up+in OSDs are busy with non-clean PGs?)."
+        print_warning "No bench-eligible OSDs found (all up+in OSDs are busy with recovery work?)."
         return 1
     fi
 
-    local hdd_samples=() ssd_samples=() nvme_samples=()
-    local hdd_ids=() ssd_ids=() nvme_ids=()
-
-    trap _bench_sigint_handler INT
-
-    local osd_id osd_class host bytes_per_sec mbps total
-    local samples_attempted=0 samples_succeeded=0
+    # Group by class so progress + summary can be per-class.
+    local -a hdd_entries=() ssd_entries=() nvme_entries=()
+    local osd_id osd_class host
     while IFS=$'\t' read -r osd_id osd_class host; do
         [ -z "$osd_id" ] && continue
-        [ "$_bench_interrupted" -eq 1 ] && break
-        samples_attempted=$((samples_attempted + 1))
         case "$osd_class" in
-            nvme) total=2147483648 ;;   # 2 GiB — stays under the default 3 GiB Ceph safety cap
-            *)    total=1073741824 ;;   # 1 GiB
+            hdd)  hdd_entries+=("$osd_id|$host") ;;
+            ssd)  ssd_entries+=("$osd_id|$host") ;;
+            nvme) nvme_entries+=("$osd_id|$host") ;;
         esac
-        printf "  benching osd.%s (%s on %s, ~%d GiB write)... " "$osd_id" "$osd_class" "$host" "$((total / 1073741824))"
-        bytes_per_sec=$(bench_one_osd "$osd_id" "$total")
+    done <<< "$osd_list"
+
+    BENCH_ERRORS=()
+    trap _bench_sigint_handler INT
+    [ "${#hdd_entries[@]}"  -gt 0 ] && _bench_class hdd  1073741824 "${hdd_entries[@]}"
+    [ "${#ssd_entries[@]}"  -gt 0 ] && _bench_class ssd  1073741824 "${ssd_entries[@]}"
+    [ "${#nvme_entries[@]}" -gt 0 ] && _bench_class nvme 2147483648 "${nvme_entries[@]}"
+    trap - INT
+
+    # Did any class succeed? If not, surface errors and bail.
+    if [ -z "$BENCH_HDD_MBPS" ] && [ -z "$BENCH_SSD_MBPS" ] && [ -z "$BENCH_NVME_MBPS" ]; then
+        print_warning "All bench samples failed."
+        _print_bench_errors
+        return 1
+    fi
+
+    _print_bench_summary
+    _print_bench_errors
+    save_bench_cache
+}
+
+# Bench one device class. Prints "Benching N <class> OSDs.....", one
+# dot per success / "E" per failure, then a summary line. Populates
+# class-specific BENCH_<CLASS>_* globals. Quiet by default — actual
+# per-OSD output is only printed if everything fails for that class.
+_bench_class() {
+    local class=$1 total=$2
+    shift 2
+    local entries=("$@")
+    local count=${#entries[@]}
+    printf "Benching %d %s OSD%s" "$count" "$class" "$([ "$count" -ne 1 ] && echo s)"
+    local -a samples=() ids=() hosts=()
+    local err_count=0 entry osd_id host bytes_per_sec mbps err_msg
+    local err_capture
+    err_capture=$(mktemp 2>/dev/null || echo "/tmp/scrubadub-bench-class.err.$$")
+    for entry in "${entries[@]}"; do
+        if [ "$_bench_interrupted" -eq 1 ]; then break; fi
+        osd_id="${entry%|*}"
+        host="${entry#*|}"
+        bytes_per_sec=$(bench_one_osd "$osd_id" "$total" 2>"$err_capture")
         if [ -z "$bytes_per_sec" ]; then
-            printf "FAILED\n"
+            printf "E"
+            err_count=$((err_count + 1))
+            err_msg=$(head -1 "$err_capture" 2>/dev/null)
+            BENCH_ERRORS+=("osd.$osd_id ($host): ${err_msg:-(no error detail)}")
             continue
         fi
         mbps=$(awk "BEGIN { printf \"%d\", $bytes_per_sec / 1048576 }")
-        printf "%d MB/s\n" "$mbps"
-        samples_succeeded=$((samples_succeeded + 1))
-        case "$osd_class" in
-            hdd)  hdd_samples+=("$mbps");  hdd_ids+=("$osd_id") ;;
-            ssd)  ssd_samples+=("$mbps");  ssd_ids+=("$osd_id") ;;
-            nvme) nvme_samples+=("$mbps"); nvme_ids+=("$osd_id") ;;
-        esac
-    done <<< "$osd_list"
-    trap - INT
-
-    [ "$samples_succeeded" -eq 0 ] && { print_warning "All bench samples failed."; return 1; }
-
-    # Aggregate per class.
-    if [ "${#hdd_samples[@]}" -gt 0 ]; then
-        BENCH_HDD_MBPS=$(printf '%s\n' "${hdd_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
-        BENCH_HDD_SAMPLE_COUNT=${#hdd_samples[@]}
-        BENCH_HDD_SOURCE="$BENCH_AGGREGATE of $BENCH_HDD_SAMPLE_COUNT sampled, just now"
-        _flag_outliers BENCH_HDD_OUTLIERS hdd_samples hdd_ids "$BENCH_HDD_MBPS"
+        samples+=("$mbps")
+        ids+=("$osd_id")
+        hosts+=("$host")
+        printf "."
+    done
+    rm -f "$err_capture"
+    local ok=$((count - err_count))
+    if [ "$_bench_interrupted" -eq 1 ]; then
+        printf " interrupted. (%d/%d before stop)\n" "$ok" "$count"
+    elif [ "$err_count" -gt 0 ]; then
+        printf " done. (%d/%d succeeded, %d failed)\n" "$ok" "$count" "$err_count"
+    else
+        printf " done. (%d/%d succeeded)\n" "$ok" "$count"
     fi
-    if [ "${#ssd_samples[@]}" -gt 0 ]; then
-        BENCH_SSD_MBPS=$(printf '%s\n' "${ssd_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
-        BENCH_SSD_SAMPLE_COUNT=${#ssd_samples[@]}
-        BENCH_SSD_SOURCE="$BENCH_AGGREGATE of $BENCH_SSD_SAMPLE_COUNT sampled, just now"
-        _flag_outliers BENCH_SSD_OUTLIERS ssd_samples ssd_ids "$BENCH_SSD_MBPS"
-    fi
-    if [ "${#nvme_samples[@]}" -gt 0 ]; then
-        BENCH_NVME_MBPS=$(printf '%s\n' "${nvme_samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
-        BENCH_NVME_SAMPLE_COUNT=${#nvme_samples[@]}
-        BENCH_NVME_SOURCE="$BENCH_AGGREGATE of $BENCH_NVME_SAMPLE_COUNT sampled, just now"
-        _flag_outliers BENCH_NVME_OUTLIERS nvme_samples nvme_ids "$BENCH_NVME_MBPS"
+    [ "${#samples[@]}" -eq 0 ] && return
+
+    # Aggregate to baseline + compute min/max/median.
+    local baseline
+    baseline=$(printf '%s\n' "${samples[@]}" | aggregate_bench "$BENCH_AGGREGATE")
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s\n' "${samples[@]}" | sort -n)
+    local n=${#sorted[@]}
+    local s_min="${sorted[0]}" s_max="${sorted[$((n-1))]}" s_med
+    if [ $((n % 2)) -eq 1 ]; then
+        s_med="${sorted[$((n/2))]}"
+    else
+        s_med=$(awk "BEGIN { printf \"%d\", (${sorted[$((n/2 - 1))]} + ${sorted[$((n/2))]}) / 2 }")
     fi
 
-    save_bench_cache
+    # Map min/max back to osd_id/host for the summary line.
+    local i min_label="" max_label=""
+    for i in "${!samples[@]}"; do
+        if [ -z "$min_label" ] && [ "${samples[$i]}" -eq "$s_min" ]; then
+            min_label="osd.${ids[$i]} on ${hosts[$i]}"
+        fi
+        if [ -z "$max_label" ] && [ "${samples[$i]}" -eq "$s_max" ]; then
+            max_label="osd.${ids[$i]} on ${hosts[$i]}"
+        fi
+    done
+
+    # Stash per-class globals. Avoid eval — explicit case keeps grep'ability.
+    case "$class" in
+        hdd)
+            BENCH_HDD_MBPS=$baseline
+            BENCH_HDD_SAMPLE_COUNT=${#samples[@]}
+            BENCH_HDD_SOURCE="$BENCH_AGGREGATE of ${#samples[@]} sampled, just now"
+            BENCH_HDD_MIN=$s_min; BENCH_HDD_MAX=$s_max; BENCH_HDD_MEDIAN=$s_med
+            BENCH_HDD_MIN_LABEL=$min_label; BENCH_HDD_MAX_LABEL=$max_label
+            _flag_outliers BENCH_HDD_OUTLIERS samples ids "$baseline"
+            ;;
+        ssd)
+            BENCH_SSD_MBPS=$baseline
+            BENCH_SSD_SAMPLE_COUNT=${#samples[@]}
+            BENCH_SSD_SOURCE="$BENCH_AGGREGATE of ${#samples[@]} sampled, just now"
+            BENCH_SSD_MIN=$s_min; BENCH_SSD_MAX=$s_max; BENCH_SSD_MEDIAN=$s_med
+            BENCH_SSD_MIN_LABEL=$min_label; BENCH_SSD_MAX_LABEL=$max_label
+            _flag_outliers BENCH_SSD_OUTLIERS samples ids "$baseline"
+            ;;
+        nvme)
+            BENCH_NVME_MBPS=$baseline
+            BENCH_NVME_SAMPLE_COUNT=${#samples[@]}
+            BENCH_NVME_SOURCE="$BENCH_AGGREGATE of ${#samples[@]} sampled, just now"
+            BENCH_NVME_MIN=$s_min; BENCH_NVME_MAX=$s_max; BENCH_NVME_MEDIAN=$s_med
+            BENCH_NVME_MIN_LABEL=$min_label; BENCH_NVME_MAX_LABEL=$max_label
+            _flag_outliers BENCH_NVME_OUTLIERS samples ids "$baseline"
+            ;;
+    esac
+}
+
+_print_bench_summary() {
+    echo
+    echo "Bench summary (aggregate: $BENCH_AGGREGATE):"
+    if [ -n "$BENCH_HDD_MBPS" ]; then
+        printf "  HDD  (%d samples): min %d (%s) / median %d / max %d MB/s\n" \
+            "$BENCH_HDD_SAMPLE_COUNT" "$BENCH_HDD_MIN" "$BENCH_HDD_MIN_LABEL" \
+            "$BENCH_HDD_MEDIAN" "$BENCH_HDD_MAX"
+    fi
+    if [ -n "$BENCH_SSD_MBPS" ]; then
+        printf "  SSD  (%d samples): min %d (%s) / median %d / max %d MB/s\n" \
+            "$BENCH_SSD_SAMPLE_COUNT" "$BENCH_SSD_MIN" "$BENCH_SSD_MIN_LABEL" \
+            "$BENCH_SSD_MEDIAN" "$BENCH_SSD_MAX"
+    fi
+    if [ -n "$BENCH_NVME_MBPS" ]; then
+        printf "  NVMe (%d samples): min %d (%s) / median %d / max %d MB/s\n" \
+            "$BENCH_NVME_SAMPLE_COUNT" "$BENCH_NVME_MIN" "$BENCH_NVME_MIN_LABEL" \
+            "$BENCH_NVME_MEDIAN" "$BENCH_NVME_MAX"
+    fi
+}
+
+_print_bench_errors() {
+    [ "${#BENCH_ERRORS[@]}" -eq 0 ] && return
+    echo
+    print_warning "Bench errors (${#BENCH_ERRORS[@]}):"
+    local err
+    for err in "${BENCH_ERRORS[@]}"; do
+        echo "  $err"
+    done
 }
 
 # Helper: populate outlier list for one class. Args: out_array_name,

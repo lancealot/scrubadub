@@ -306,10 +306,11 @@ rm -f "$CACHE"
 # 18a. First run: benches all 6 OSDs (1 per host per class).
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
         --bench-osds --bench-cache-file "$CACHE" 2>&1)
-check     "selects one HDD per host"                 "$out" "benching osd.0 (hdd on host-a"
-check     "selects one HDD per host (b)"             "$out" "benching osd.4 (hdd on host-b"
-check     "selects one HDD per host (c)"             "$out" "benching osd.8 (hdd on host-c"
-check     "selects one SSD per host"                 "$out" "benching osd.3 (ssd on host-a"
+check     "HDD class progress line"                  "$out" "Benching 3 hdd OSDs... done. (3/3 succeeded)"
+check     "SSD class progress line"                  "$out" "Benching 3 ssd OSDs... done. (3/3 succeeded)"
+check     "summary identifies slow HDD by host"      "$out" "min 80 (osd.8 on host-c)"
+check     "summary shows HDD max"                    "$out" "median 200 / max 220 MB/s"
+check     "summary shows SSD numbers"                "$out" "SSD  (3 samples): min 580"
 check     "throughput source switches to bench"      "$out" "source: median of 3 sampled, just now"
 check     "outlier osd.8 flagged at default 0.5x"    "$out" "HDD outliers below 0.5× baseline: osd.8 (80 MB/s)"
 check_not "no SSD outliers (all ~600 MB/s)"          "$out" "SSD outliers below"
@@ -319,14 +320,14 @@ check     "cache file written"                       "$out" "Bench results cache
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
         --bench-osds --bench-cache-file "$CACHE" 2>&1)
 check     "second run loads from cache"              "$out" "Loaded bench cache"
-check_not "no benches launched on cache hit"         "$out" "benching osd."
+check_not "no class-progress lines on cache hit"     "$out" "Benching 3 hdd OSDs"
 check     "outlier persisted in cache"               "$out" "HDD outliers below 0.5× baseline: osd.8"
 check     "source label says 'cache'"                "$out" "source: median of 3 sampled, cache "
 
 # 18c. --refresh-bench bypasses cache.
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed \
         --bench-osds --bench-cache-file "$CACHE" --refresh-bench 2>&1)
-check     "--refresh-bench re-runs benches"          "$out" "benching osd.0 (hdd"
+check     "--refresh-bench re-runs benches"          "$out" "Benching 3 hdd OSDs"
 check_not "--refresh-bench doesn't load cache"       "$out" "Loaded bench cache"
 
 # 18d. --bench-aggregate p25 picks the slowest of the trio (80 MB/s for HDD).
