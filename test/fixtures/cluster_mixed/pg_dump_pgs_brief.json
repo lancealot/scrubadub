@@ -10,6 +10,7 @@
     {"pgid": "2.1",  "state": "active+clean", "last_scrub_stamp": "2026-05-14T11:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-12T12:00:00.000000+0000"},
     {"pgid": "3.0",  "state": "active+clean", "last_scrub_stamp": "2026-05-10T05:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-15T12:00:00.000000+0000"},
     {"pgid": "3.1",  "state": "active+clean", "last_scrub_stamp": "2026-05-12T07:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-30T12:00:00.000000+0000"},
-    {"pgid": "3.2",  "state": "active+clean", "last_scrub_stamp": "2026-05-09T14:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-10T12:00:00.000000+0000"}
+    {"pgid": "3.2",  "state": "active+clean", "last_scrub_stamp": "2026-05-09T14:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-10T12:00:00.000000+0000"},
+    {"pgid": "3.3",  "state": "active+clean+scrubbing+deep", "up": [0, 3, 4, 7, 8, 11], "last_scrub_stamp": "2026-05-09T15:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-10T13:00:00.000000+0000"}
   ]
 }

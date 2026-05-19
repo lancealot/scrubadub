@@ -828,10 +828,16 @@ select_bench_osds() {
     local tree
     tree=$(run_ceph osd tree --format json) || return 1
 
-    # OSDs to skip: any OSD in the up_set of a non-active+clean PG.
+    # OSDs to skip: any OSD in the up_set of a PG that's genuinely busy
+    # with recovery work. "active+clean+scrubbing" / "...+deep" are normal
+    # background scrubs and don't make the OSD unrepresentative — earlier
+    # versions of this filter excluded those too, which on busy clusters
+    # (600 PGs scrubbing at once) left zero eligible HDD OSDs.
     local busy_osds
     busy_osds=" $(run_ceph pg dump pgs_brief --format json 2>/dev/null | jq -r '
-        .pg_stats[]? | select(.state != "active+clean") | .up[]?
+        .pg_stats[]?
+        | select(.state | test("backfill|recover|peering|stale|down|incomplete|creating|remapped"))
+        | .up[]?
     ' | sort -u | tr '\n' ' ') "
 
     # One pass: walk hosts to build osd_id -> host map; then walk OSDs and
