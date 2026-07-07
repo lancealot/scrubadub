@@ -82,6 +82,32 @@
         "bytes_used": 629145600,
         "percent_used": 0.0
       }
+    },
+    {
+      "name": "lightfs-01_meta",
+      "id": 7,
+      "stats": {
+        "stored": 1160000000,
+        "stored_data": 920000000,
+        "stored_omap": 240000000,
+        "objects": 8000,
+        "kb_used": 3398437,
+        "bytes_used": 3480000000,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "lightfs-01_data",
+      "id": 8,
+      "stats": {
+        "stored": 53687091200,
+        "stored_data": 53687091200,
+        "stored_omap": 0,
+        "objects": 12800,
+        "kb_used": 157286400,
+        "bytes_used": 161061273600,
+        "percent_used": 0.0
+      }
     }
   ]
 }

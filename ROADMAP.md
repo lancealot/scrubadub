@@ -452,16 +452,21 @@ mixed classes.
 appropriate values per class.
 
 ### `[x]` 4.2 Emit `ceph osd pool set <pool> ...`
-**Why.** Metadata/index pools (RGW index, RBD headers, CephFS metadata)
-and cold bulk pools need different scrub behavior.
-**What.** Identify metadata/index pools from `ceph df detail` by
-OMAP-dominance (`stored_omap` > `stored_data`) — metadata lives in
-OMAP, bulk data in objects. Emit a tighter `deep_scrub_interval` per
-such pool. Falls back to the average-object-size heuristic on Ceph
-releases that don't report the OMAP/DATA split. Also flags pools with
-`noscrub`/`nodeep-scrub` set.
-**Accept.** Pool-scoped lines appear for OMAP-dominant pools; bulk
-data pools with small objects are correctly excluded.
+**Why.** Metadata/index pools (RGW index, CephFS metadata) and cold
+bulk pools need different scrub behavior.
+**What.** Identify metadata/index pools by role, in priority: (1) CephFS
+metadata via `application_metadata` `{"cephfs":{"metadata":...}}` —
+size-independent, since a lightly-used FS is journal-dominant (DATA)
+despite being metadata; (2) RGW bucket index via the `.buckets.index`
+name suffix (RGW gives all its pools the same `{"rgw":{}}` application,
+no role); (3) OMAP-dominance (`stored_omap` > `stored_data`, OMAP > 1
+MiB) for omap-heavy pools generally. Falls back to the average-object-
+size heuristic on Ceph releases without the OMAP/DATA split. Emits a
+tighter `deep_scrub_interval` per pool; also flags `noscrub` /
+`nodeep-scrub`.
+**Accept.** CephFS metadata (even DATA-dominant) and RGW indexes are
+flagged; bulk data pools — including small-object ones and CephFS data
+pools — are correctly excluded.
 
 ### `[x]` 4.3 Per-pool sizing observations (large PGs)
 **Why.** Large PGs make deep-scrub and recovery take proportionally

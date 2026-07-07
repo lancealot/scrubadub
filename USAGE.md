@@ -429,18 +429,32 @@ Two patterns trigger pool-level recommendations:
 - **Metadata / index pools.** scrubadub emits a
   `deep_scrub_interval = 259200` (3-day) override via
   `ceph osd pool set <pool> deep_scrub_interval` for pools that hold
-  metadata — RGW bucket indexes, RBD metadata, CephFS metadata,
-  omap-heavy pools. These want frequent integrity verification because
-  the consequences of bit-rot are immediate and silent.
+  metadata — RGW bucket indexes, CephFS metadata, omap-heavy pools.
+  These want frequent integrity verification because the consequences
+  of bit-rot are immediate and silent.
 
-  Detection uses the **OMAP/DATA breakdown** from `ceph df detail`
-  (`stored_omap` vs `stored_data`): a metadata pool stores its payload
-  in OMAP (RocksDB), while a bulk data pool stores it as objects. This
-  is more reliable than average object size alone — a `*.buckets.data`
-  pool full of thumbnails has a small average object size but is *not*
-  a metadata pool, and should not get the tighter cadence. On Ceph
-  releases too old to report the OMAP/DATA split, scrubadub falls back
-  to the average-object-size heuristic (under 64 KB average).
+  Detection is **role-aware**, in priority order:
+
+  1. **CephFS metadata pools** — identified by `application_metadata`
+     (`{"cephfs":{"metadata":"<fs>"}}`), regardless of size or byte
+     ratio. This matters: a lightly-used filesystem keeps more in the
+     MDS journal (stored as objects / DATA) than in dentry OMAP, so the
+     pool reads as DATA-dominant even though it is unambiguously
+     metadata. Role beats ratio here.
+  2. **RGW bucket index pools** — RGW tags every pool merely as
+     `{"rgw":{}}` with no role, so scrubadub keys on the stable
+     `.buckets.index` name suffix. This catches even a near-empty index
+     that the OMAP floor below would skip.
+  3. **OMAP-dominant pools** — from the OMAP/DATA breakdown in
+     `ceph df detail` (`stored_omap` > `stored_data`, and OMAP over
+     1 MiB so empty pools are skipped). A metadata pool stores its
+     payload in OMAP (RocksDB); a bulk data pool stores it as objects.
+     This is far more reliable than average object size alone — a
+     `*.buckets.data` pool full of thumbnails has a small average
+     object size but is *not* a metadata pool.
+
+  On Ceph releases too old to report the OMAP/DATA split, scrubadub
+  falls back to the average-object-size heuristic (under 64 KB average).
 
 Both per-class and per-pool sections appear only when the cluster
 matches the relevant shape — they're skipped on single-class clusters

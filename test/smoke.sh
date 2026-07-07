@@ -113,7 +113,7 @@ echo "Test 7: Phase 3 — network ceiling"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 2>&1)
 check     "1 GbE × 3 hosts → 375 MB/s ceiling"  "$out" "Network ceiling:     375 MB/s"
 check     "binding ceiling shows network-bound" "$out" "network-bound"
-check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~262 hours"
+check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~257 hours"
 
 # No --nic-gbps in prompt mode → no network ceiling
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
@@ -161,12 +161,18 @@ check     "per-pool section appears"                         "$out" "Per-pool ov
 check     "noscrub flag warning fires"                       "$out" "Pool paused-bulk: hashpspool,noscrub,nodeep-scrub"
 check     "documented syntax used for clearing noscrub"      "$out" "ceph osd pool set paused-bulk noscrub false"
 check     "documented syntax used for nodeep-scrub"          "$out" "ceph osd pool set paused-bulk nodeep-scrub false"
-check     "OMAP-dominant pool flagged (index)"               "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
+check     "RGW index flagged (by .buckets.index name)"       "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
 check     "override labelled metadata/index"                 "$out" "metadata/index pool → tighten scrub cadence"
 check     "apply line uses pool set syntax"                  "$out" "ceph osd pool set rgw.buckets.index deep_scrub_interval 259200"
-# The tightening: a small-object DATA pool (many small files, but payload
-# in objects not OMAP) must NOT be flagged. Old avg-object heuristic would.
+# Role detection: a CephFS metadata pool that is DATA-dominant (journal
+# outweighs dentry OMAP, as on a lightly-used filesystem) must still be
+# flagged — caught by application role, not OMAP ratio.
+check     "DATA-dominant CephFS metadata flagged by role"    "$out" "lightfs-01_meta          deep_scrub_interval = 259200"
+# The tightening: a small-object DATA pool (payload in objects, not OMAP)
+# must NOT be flagged. The old avg-object heuristic would have flagged it.
 check_not "small-object DATA pool not flagged"               "$out" "s3-thumbnails-data       deep_scrub_interval"
+# And a CephFS *data* pool must NOT be flagged — only the metadata role is.
+check_not "CephFS data pool not flagged"                     "$out" "lightfs-01_data          deep_scrub_interval"
 
 # Fallback path: on a cluster whose 'ceph df detail' predates OMAP stats
 # (no stored_omap/stored_data), detection falls back to the small-object
@@ -244,7 +250,7 @@ echo "Test 16: Phase 5.3-prep — --emit-backup-plan"
 PLAN=$(mktemp /tmp/scrubadub-backup-plan.XXXXXX.tsv)
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --emit-backup-plan "$PLAN" 2>&1)
 check     "writer confirms success"                  "$out" "Backup plan written to"
-check     "row count reported"                       "$out" "(11 rows)"
+check     "row count reported"                       "$out" "(12 rows)"
 plan_body=$(grep -v '^#' "$PLAN")
 check     "global osd row captures current value"    "$plan_body" "osd	osd		osd_deep_scrub_interval	1209600"
 check     "global row records current sleep"         "$plan_body" "osd	osd		osd_scrub_sleep	0.0"
@@ -298,11 +304,11 @@ check_not "no local-node NIC warning when overridden" "$out" "NIC speed auto-det
 check     "explicit --nic-gbps source shown"          "$out" "source: --nic-gbps"
 
 # 17d. Scrub-time math uses unique PG count, not OSD-assignment sum.
-# Fixture has 912 unique PGs and 1136 OSD-assignments. Estimated
-# scrub-time with the old (broken) formula was ~37h; with the fix it's
-# ~29h (using 912 × 28 GB × 11/8 / 330 MB/s).
+# Uses unique-PG count (not the sum of per-OSD assignments). The exact
+# hour figure tracks fixture totals; the point of this check is that the
+# estimate is derived from unique PGs, not OSD-assignment count.
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
-check     "scrub-time uses unique-PG count"           "$out" "Deep scrub time:     ~29 hours"
+check     "scrub-time uses unique-PG count"           "$out" "Deep scrub time:     ~28 hours"
 check     "per-class label says 'PG replicas'"        "$out" "PG replicas: 896 (avg 99 per OSD)"
 check_not "old 'PGs:' label gone from per-class"      "$out" "  - PGs: 896"
 check     "ingest notice uses 'PG-OSD assignments'"   "$out" "PG-OSD assignments by class"
@@ -392,7 +398,7 @@ check     "Reasoning section appears"            "$out" "=== Reasoning ==="
 check     "explains osd_deep_scrub_interval"     "$out" "How often each PG gets a full data-integrity deep-scrub"
 check     "explains osd_scrub_sleep"             "$out" "Pause (seconds, float) between scrub-chunk reads"
 check     "explains class override"              "$out" "Faster device classes don't need the global"
-check     "explains pool override"               "$out" "Metadata/index pool (OMAP-dominant"
+check     "explains pool override"               "$out" "Metadata/index pool (CephFS metadata by application role"
 check_not "no-change params absent from why"     "$out" "Lower bound for shallow-scrub eligibility"
 
 # 19c. No "Phase" references in operator-facing output.

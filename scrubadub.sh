@@ -1423,8 +1423,9 @@ ingest_pool_details() {
     total_unique_pgs=$total_pgs
 
     # Phase 4.2: walk pools again for per-pool overrides and footgun flags.
-    # Metadata/index pools (OMAP-dominant) want shorter deep-scrub intervals;
-    # the noscrub / nodeep-scrub pool flags are silent integrity killers.
+    # Metadata/index pools (CephFS metadata by role, RGW index by name, or
+    # OMAP-dominant) want shorter deep-scrub intervals; the noscrub /
+    # nodeep-scrub pool flags are silent integrity killers.
     pool_overrides=()
     pool_warnings=()
     local pool_row
@@ -1447,25 +1448,35 @@ ingest_pool_details() {
         | ($d.stats.stored // 0) as $st
         | ($d.stats.objects // 0) as $obj
         | (($p.flags_names // "") | tostring) as $flags
-        # OMAP/DATA breakdown identifies metadata/index pools: they store
-        # their payload in OMAP (RocksDB), while bulk data pools store it as
-        # objects. This is the reliable signal — a small average object size
-        # alone gives false positives on data pools that merely hold many
-        # small files (e.g. an RGW *.buckets.data pool of thumbnails).
-        # Prefer the logical stored_* pair; fall back to the raw *_bytes_used
-        # pair; if neither is present (pre-Nautilus), fall back to the old
-        # small-object heuristic.
+        | ($p.application_metadata // {}) as $app
+        # Role signals — authoritative and size-independent:
+        #   1. CephFS metadata pool. Tagged "cephfs":{"metadata":"<fs>"}.
+        #      Must be caught by ROLE, not OMAP ratio: a lightly-used
+        #      filesystem stores more in the MDS journal (objects/DATA)
+        #      than in dentry OMAP, so the pool reads as DATA-dominant.
+        #   2. RGW bucket index pool. RGW tags every pool merely as
+        #      "rgw":{}, with no role, so we key on the stable ".buckets
+        #      .index" name suffix. Catches tiny indexes the OMAP floor
+        #      would otherwise skip.
+        | ((($app.cephfs // {}) | .metadata) != null) as $is_cephfs_meta
+        | (($app.rgw != null) and ($p.pool_name | endswith(".buckets.index"))) as $is_rgw_index
+        # OMAP/DATA breakdown catches omap-heavy pools generally. Metadata
+        # lives in OMAP (RocksDB), bulk data in objects — so a small average
+        # object size alone (the old heuristic) gives false positives on
+        # data pools of many small files. Prefer the logical stored_* pair;
+        # fall back to the raw *_bytes_used pair.
         | (if ($d.stats.stored_omap != null and $d.stats.stored_data != null)
              then {omap: $d.stats.stored_omap, data: $d.stats.stored_data}
            elif ($d.stats.omap_bytes_used != null and $d.stats.data_bytes_used != null)
              then {omap: $d.stats.omap_bytes_used, data: $d.stats.data_bytes_used}
            else null end) as $bd
-        | (if $bd != null then
-             # Metadata/index pool: OMAP dominates, and is non-trivial (> 1 MiB
-             # so we skip empty pools where tightening would be pointless).
+        | (if $is_cephfs_meta or $is_rgw_index then "1"
+           elif $bd != null then
+             # OMAP dominates and is non-trivial (> 1 MiB, so empty pools
+             # where tightening would be pointless are skipped).
              (if $bd.omap > $bd.data and $bd.omap > 1048576 then "1" else "0" end)
            else
-             # No OMAP stats available: fall back to the small-object heuristic.
+             # No OMAP stats (pre-Nautilus): fall back to small-object heuristic.
              (if $obj > 0 and ($st / $obj) < 65536 and $st > 1048576 then "1" else "0" end)
            end) as $hot
         | "\($p.pool_name)|\($st)|\($obj)|\($flags)|\($hot)"
@@ -1668,10 +1679,10 @@ render_why() {
             local v="${kv#* = }"
             echo
             printf "${BOLD}pool/%s %s = %s${NC}\n" "$pname" "$p" "$v"
-            echo "  Metadata/index pool (OMAP-dominant — typical of RGW indexes, RBD"
-            echo "  metadata, CephFS metadata). Tightening deep_scrub_interval to 3 days"
-            echo "  verifies integrity more often; bit-rot on metadata has outsized impact"
-            echo "  compared to bulk-data pools."
+            echo "  Metadata/index pool (CephFS metadata by application role, RGW bucket"
+            echo "  index by name, or OMAP-dominant). Tightening deep_scrub_interval to 3"
+            echo "  days verifies integrity more often; bit-rot on metadata has outsized"
+            echo "  impact compared to bulk-data pools."
         done
     fi
 }
