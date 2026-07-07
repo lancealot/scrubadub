@@ -565,6 +565,35 @@ utilization, and headroom against `osd_deep_scrub_interval`.
 
 ---
 
+## Exploratory — not scheduled, revisit later
+
+### `[ ]` E.1 OMAP-aware per-pool scrub-time model
+**Why.** The current scrub-time estimate is bandwidth-bound (bytes to
+scrub ÷ MB/s). That's right for bulk data pools, but deep-scrubbing an
+OMAP-heavy metadata pool is **key-iteration-bound**, not bandwidth-
+bound — the OSD walks and checksums billions of small RocksDB
+key/value pairs, which is IOPS/CPU work. A pool like a busy CephFS
+metadata pool (e.g. 762M objects, ~1 TiB OMAP on one observed cluster)
+can take far longer to deep-scrub than its byte count implies, so the
+cluster-wide bandwidth estimate understates it.
+**What (sketch).** Move from a single cluster-wide estimate to a
+per-pool breakdown. For OMAP-dominant pools, weight the scrub-time
+contribution by object / OMAP-entry count (with a per-entry cost
+constant) rather than pure bytes. Surface a per-pool scrub-time table.
+Would also let per-pool `deep_scrub_interval` recommendations be
+sanity-checked against each pool's own estimated completion time.
+**Open questions.** What per-OMAP-entry cost constant is defensible
+(needs measurement, likely via `ceph tell osd bench` variants or
+observed scrub durations)? Is `ceph df detail` object count a good
+enough proxy for OMAP-entry count? Worth the added model complexity
+for most clusters, or only omap-heavy ones?
+**Status.** Surfaced during a discussion of storing data in CephFS
+metadata pools via xattrs (which push a metadata pool further toward
+OMAP-dominance). Not needed now; revisit if per-pool scrub timing
+becomes a real operator pain point.
+
+---
+
 ## Out of scope (for now)
 
 - Python rewrite or any non-bash implementation.
