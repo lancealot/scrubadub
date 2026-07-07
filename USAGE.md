@@ -1,35 +1,31 @@
 # Scrubadub Usage Guide
 
-> **Roadmap:** scrubadub is being reshaped from a prompt-driven helper
-> into a cluster-ingested tool that detects WPQ vs mClock and emits
-> appropriate recommendations. See [ROADMAP.md](ROADMAP.md) for the
-> phased plan and tracked work.
+Scrubadub reads a Ceph cluster's real state and recommends scrub
+settings that balance data integrity against client impact. See
+[ROADMAP.md](ROADMAP.md) for completed work and what's planned next.
 
 ## Overview
 Scrubadub helps calculate optimal scrub settings for Ceph clusters. It
-takes your cluster's OSD composition, PG distribution, and workload
-pattern, and recommends scrub parameters that balance data integrity
-with cluster performance.
-
-### Known v1 caveats
-
-Several items below describe v1 behavior that is being corrected in
-[ROADMAP.md Phase 0](ROADMAP.md#phase-0--correctness-fixes). Where the
-caveat affects you operationally, it's called out inline.
+takes your cluster's OSD composition, PG distribution, pool roles, and
+workload pattern, and recommends scrub parameters that balance data
+integrity with cluster performance. Run on a monitor node it reads all
+of this automatically; off-cluster it falls back to interactive prompts
+for what-if modeling.
 
 ## Two modes: prompt vs cluster-ingested
 
 scrubadub runs in either of two modes:
 
-- **Prompt mode** (default). You type in OSD counts, PG counts, and
-  pick a workload type. Useful for off-cluster modeling and for
-  exploring "what would scrubadub recommend if...?" scenarios.
-- **Cluster-ingested mode** (`--from-cluster`, Phase 1). Run on a Ceph
-  monitor node; scrubadub reads OSD inventory, PG distribution, pool
-  sizes, current scrub config, the active scheduler, and the scrub
+- **Cluster-ingested mode** (`--from-cluster`). Run on a Ceph monitor
+  node; scrubadub reads OSD inventory, PG distribution, pool sizes and
+  roles, current scrub config, the active scheduler, and the scrub
   backlog directly from the `ceph` CLI. Requires `ceph` and `jq` on
   PATH. By default refuses to run if it doesn't detect a mon node;
-  pass `--force` to override.
+  pass `--force` to override. This is the primary way to run scrubadub.
+- **Prompt mode** (default when `--from-cluster` is absent). You type in
+  OSD counts, PG counts, and pick a workload type. Useful for
+  off-cluster modeling and "what would scrubadub recommend if...?"
+  scenarios.
 
 Workload type isn't auto-detectable. In cluster mode, either pass
 `--workload {read|write|mixed|archive}` or let scrubadub prompt you
@@ -37,14 +33,20 @@ for it.
 
 ### Cluster-mode output
 
-In `--from-cluster` mode scrubadub adds two sections to the report:
+In `--from-cluster` mode scrubadub adds these sections to the report:
 
 1. **Scrub Backlog** — total PG count and how many are past their
-   scrub / deep-scrub interval (the same signal `ceph health detail`
-   raises as `PG_NOT_(DEEP_)SCRUBBED_IN_TIME`).
+   scrub / deep-scrub interval, read from `ceph health detail`
+   (`PG_NOT_(DEEP_)SCRUBBED_IN_TIME`).
 2. **Proposed Changes** — each recommended parameter rendered as
-   `current → proposed`, highlighting only what would change. This
-   is the foundation for the Phase 5 apply/diff/rollback workflow.
+   `current → proposed`, highlighting only what would change.
+3. **Per-class / per-pool overrides** — scheduler and pool-scoped
+   recommendations where the cluster's shape calls for them.
+4. **Per-pool sizing observations** — pools with very large per-PG data.
+
+Use `--diff` to print only the delta and exit, `--why` to add a
+reasoning section, and `--emit-backup-plan FILE` to write the
+would-rollback state. All are read-only.
 
 ## Command-line flags
 
