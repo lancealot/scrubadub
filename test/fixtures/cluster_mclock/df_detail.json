@@ -37,6 +37,17 @@
         "bytes_used": 30236507645952,
         "percent_used": 0.114
       }
+    },
+    {
+      "name": "legacy-rgw-index",
+      "id": 4,
+      "stats": {
+        "stored": 8388608,
+        "objects": 131072,
+        "kb_used": 24576,
+        "bytes_used": 25165824,
+        "percent_used": 0.0
+      }
     }
   ]
 }

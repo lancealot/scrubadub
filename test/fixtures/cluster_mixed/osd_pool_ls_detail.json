@@ -51,5 +51,17 @@
     "pg_num": 8,
     "erasure_code_profile": "",
     "flags_names": "hashpspool,noscrub,nodeep-scrub"
+  },
+  {
+    "pool_name": "s3-thumbnails-data",
+    "pool_id": 6,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "pg_autoscale_mode": "on",
+    "application_metadata": { "rgw": {} }
   }
 ]

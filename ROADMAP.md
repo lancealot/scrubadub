@@ -452,13 +452,16 @@ mixed classes.
 appropriate values per class.
 
 ### `[x]` 4.2 Emit `ceph osd pool set <pool> ...`
-**Why.** Hot pools (RGW index, RBD headers) and cold bulk pools
-need different scrub behavior.
-**What.** Identify hot vs cold pools from `ceph df detail`
-(IOPS/bytes ratio). Emit `osd osd_scrub_*` overrides per pool where
-appropriate.
-**Accept.** Pool-scoped lines appear when the cluster has pools of
-distinctly different size/IO profiles.
+**Why.** Metadata/index pools (RGW index, RBD headers, CephFS metadata)
+and cold bulk pools need different scrub behavior.
+**What.** Identify metadata/index pools from `ceph df detail` by
+OMAP-dominance (`stored_omap` > `stored_data`) — metadata lives in
+OMAP, bulk data in objects. Emit a tighter `deep_scrub_interval` per
+such pool. Falls back to the average-object-size heuristic on Ceph
+releases that don't report the OMAP/DATA split. Also flags pools with
+`noscrub`/`nodeep-scrub` set.
+**Accept.** Pool-scoped lines appear for OMAP-dominant pools; bulk
+data pools with small objects are correctly excluded.
 
 ### `[x]` 4.3 Per-pool sizing observations (large PGs)
 **Why.** Large PGs make deep-scrub and recovery take proportionally

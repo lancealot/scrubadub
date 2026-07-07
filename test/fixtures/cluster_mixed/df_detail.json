@@ -10,6 +10,8 @@
       "id": 1,
       "stats": {
         "stored": 4398046511104,
+        "stored_data": 4398046511104,
+        "stored_omap": 0,
         "objects": 1100000,
         "kb_used": 12884901888,
         "bytes_used": 13194139533312,
@@ -21,6 +23,8 @@
       "id": 2,
       "stats": {
         "stored": 549755813888,
+        "stored_data": 549755813888,
+        "stored_omap": 0,
         "objects": 140000,
         "kb_used": 1610612736,
         "bytes_used": 1649267441664,
@@ -32,6 +36,8 @@
       "id": 3,
       "stats": {
         "stored": 21990232555520,
+        "stored_data": 21990232555520,
+        "stored_omap": 0,
         "objects": 5500000,
         "kb_used": 29527214489,
         "bytes_used": 30236507645952,
@@ -43,6 +49,8 @@
       "id": 4,
       "stats": {
         "stored": 8388608,
+        "stored_data": 0,
+        "stored_omap": 8388608,
         "objects": 131072,
         "kb_used": 24576,
         "bytes_used": 25165824,
@@ -54,9 +62,24 @@
       "id": 5,
       "stats": {
         "stored": 1073741824,
+        "stored_data": 1073741824,
+        "stored_omap": 0,
         "objects": 256,
         "kb_used": 3145728,
         "bytes_used": 3221225472,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "s3-thumbnails-data",
+      "id": 6,
+      "stats": {
+        "stored": 209715200,
+        "stored_data": 209715200,
+        "stored_omap": 0,
+        "objects": 6400,
+        "kb_used": 614400,
+        "bytes_used": 629145600,
         "percent_used": 0.0
       }
     }

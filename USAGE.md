@@ -426,12 +426,21 @@ Two patterns trigger pool-level recommendations:
   integrity killer — scrubs simply don't run on that pool, regardless
   of how the OSD scrub config looks. scrubadub flags it with the
   `ceph osd pool unset` commands needed to re-enable scrubbing.
-- **Hot / index pools.** When average object size for a pool is under
-  64 KB (typical of RGW index pools, RBD metadata pools, omap-heavy
-  workloads), scrubadub emits a `deep_scrub_interval = 259200`
-  (3-day) override via `ceph osd pool set <pool> deep_scrub_interval`.
-  Index pools want frequent integrity verification because the
-  consequences of bit-rot are immediate and silent.
+- **Metadata / index pools.** scrubadub emits a
+  `deep_scrub_interval = 259200` (3-day) override via
+  `ceph osd pool set <pool> deep_scrub_interval` for pools that hold
+  metadata — RGW bucket indexes, RBD metadata, CephFS metadata,
+  omap-heavy pools. These want frequent integrity verification because
+  the consequences of bit-rot are immediate and silent.
+
+  Detection uses the **OMAP/DATA breakdown** from `ceph df detail`
+  (`stored_omap` vs `stored_data`): a metadata pool stores its payload
+  in OMAP (RocksDB), while a bulk data pool stores it as objects. This
+  is more reliable than average object size alone — a `*.buckets.data`
+  pool full of thumbnails has a small average object size but is *not*
+  a metadata pool, and should not get the tighter cadence. On Ceph
+  releases too old to report the OMAP/DATA split, scrubadub falls back
+  to the average-object-size heuristic (under 64 KB average).
 
 Both per-class and per-pool sections appear only when the cluster
 matches the relevant shape — they're skipped on single-class clusters

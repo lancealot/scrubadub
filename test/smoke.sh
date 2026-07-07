@@ -113,7 +113,7 @@ echo "Test 7: Phase 3 — network ceiling"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --nic-gbps 1 2>&1)
 check     "1 GbE × 3 hosts → 375 MB/s ceiling"  "$out" "Network ceiling:     375 MB/s"
 check     "binding ceiling shows network-bound" "$out" "network-bound"
-check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~260 hours"
+check     "deep-scrub time inflates accordingly" "$out" "Deep scrub time:     ~262 hours"
 
 # No --nic-gbps in prompt mode → no network ceiling
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
@@ -161,8 +161,19 @@ check     "per-pool section appears"                         "$out" "Per-pool ov
 check     "noscrub flag warning fires"                       "$out" "Pool paused-bulk: hashpspool,noscrub,nodeep-scrub"
 check     "documented syntax used for clearing noscrub"      "$out" "ceph osd pool set paused-bulk noscrub false"
 check     "documented syntax used for nodeep-scrub"          "$out" "ceph osd pool set paused-bulk nodeep-scrub false"
-check     "hot pool deep_scrub_interval override"            "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
+check     "OMAP-dominant pool flagged (index)"               "$out" "rgw.buckets.index        deep_scrub_interval = 259200"
+check     "override labelled metadata/index"                 "$out" "metadata/index pool → tighten scrub cadence"
 check     "apply line uses pool set syntax"                  "$out" "ceph osd pool set rgw.buckets.index deep_scrub_interval 259200"
+# The tightening: a small-object DATA pool (many small files, but payload
+# in objects not OMAP) must NOT be flagged. Old avg-object heuristic would.
+check_not "small-object DATA pool not flagged"               "$out" "s3-thumbnails-data       deep_scrub_interval"
+
+# Fallback path: on a cluster whose 'ceph df detail' predates OMAP stats
+# (no stored_omap/stored_data), detection falls back to the small-object
+# heuristic. The mclock fixture has no OMAP fields; its legacy-rgw-index
+# pool (64-byte avg objects) must still be flagged.
+out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "fallback flags small-object pool (no OMAP stats)"  "$out" "legacy-rgw-index"
 
 # Prompt mode has no pool data so no per-pool section.
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
@@ -381,7 +392,7 @@ check     "Reasoning section appears"            "$out" "=== Reasoning ==="
 check     "explains osd_deep_scrub_interval"     "$out" "How often each PG gets a full data-integrity deep-scrub"
 check     "explains osd_scrub_sleep"             "$out" "Pause (seconds, float) between scrub-chunk reads"
 check     "explains class override"              "$out" "Faster device classes don't need the global"
-check     "explains pool override"               "$out" "Hot pool (small avg object size"
+check     "explains pool override"               "$out" "Metadata/index pool (OMAP-dominant"
 check_not "no-change params absent from why"     "$out" "Lower bound for shallow-scrub eligibility"
 
 # 19c. No "Phase" references in operator-facing output.

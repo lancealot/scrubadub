@@ -1423,7 +1423,7 @@ ingest_pool_details() {
     total_unique_pgs=$total_pgs
 
     # Phase 4.2: walk pools again for per-pool overrides and footgun flags.
-    # Hot pools (small avg object size) want shorter deep-scrub intervals;
+    # Metadata/index pools (OMAP-dominant) want shorter deep-scrub intervals;
     # the noscrub / nodeep-scrub pool flags are silent integrity killers.
     pool_overrides=()
     pool_warnings=()
@@ -1447,8 +1447,27 @@ ingest_pool_details() {
         | ($d.stats.stored // 0) as $st
         | ($d.stats.objects // 0) as $obj
         | (($p.flags_names // "") | tostring) as $flags
-        | (if $obj > 0 and ($st / $obj) < 65536 and $st > 1048576
-             then "1" else "0" end) as $hot
+        # OMAP/DATA breakdown identifies metadata/index pools: they store
+        # their payload in OMAP (RocksDB), while bulk data pools store it as
+        # objects. This is the reliable signal — a small average object size
+        # alone gives false positives on data pools that merely hold many
+        # small files (e.g. an RGW *.buckets.data pool of thumbnails).
+        # Prefer the logical stored_* pair; fall back to the raw *_bytes_used
+        # pair; if neither is present (pre-Nautilus), fall back to the old
+        # small-object heuristic.
+        | (if ($d.stats.stored_omap != null and $d.stats.stored_data != null)
+             then {omap: $d.stats.stored_omap, data: $d.stats.stored_data}
+           elif ($d.stats.omap_bytes_used != null and $d.stats.data_bytes_used != null)
+             then {omap: $d.stats.omap_bytes_used, data: $d.stats.data_bytes_used}
+           else null end) as $bd
+        | (if $bd != null then
+             # Metadata/index pool: OMAP dominates, and is non-trivial (> 1 MiB
+             # so we skip empty pools where tightening would be pointless).
+             (if $bd.omap > $bd.data and $bd.omap > 1048576 then "1" else "0" end)
+           else
+             # No OMAP stats available: fall back to the small-object heuristic.
+             (if $obj > 0 and ($st / $obj) < 65536 and $st > 1048576 then "1" else "0" end)
+           end) as $hot
         | "\($p.pool_name)|\($st)|\($obj)|\($flags)|\($hot)"
     ')
 
@@ -1649,9 +1668,10 @@ render_why() {
             local v="${kv#* = }"
             echo
             printf "${BOLD}pool/%s %s = %s${NC}\n" "$pname" "$p" "$v"
-            echo "  Hot pool (small avg object size — typical of RGW indexes, RBD metadata)."
-            echo "  Tightening deep_scrub_interval to 3 days verifies integrity more often;"
-            echo "  bit-rot on metadata has outsized impact compared to bulk-data pools."
+            echo "  Metadata/index pool (OMAP-dominant — typical of RGW indexes, RBD"
+            echo "  metadata, CephFS metadata). Tightening deep_scrub_interval to 3 days"
+            echo "  verifies integrity more often; bit-rot on metadata has outsized impact"
+            echo "  compared to bulk-data pools."
         done
     fi
 }
@@ -2081,7 +2101,7 @@ if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
     for override in "${pool_overrides[@]}"; do
         pname="${override%%#*}"
         kv="${override#*#}"
-        printf "  %-24s %s  (small avg object size → tighten scrub cadence)\n" "$pname" "$kv"
+        printf "  %-24s %s  (metadata/index pool → tighten scrub cadence)\n" "$pname" "$kv"
     done
 fi
 
