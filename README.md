@@ -1,5 +1,5 @@
 
-![alt_text](https://github.com/lancealot/scrubadub/blob/main/scrubadub.png?raw=true)
+![scrubadub](https://raw.githubusercontent.com/lancealot/scrubadub/assets/scrubadub.png)
 
 # Scrubadub
 
