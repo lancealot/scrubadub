@@ -1,0 +1,15 @@
+{
+  "pg_ready": true,
+  "pg_stats": [
+    {"pgid": "1.0",  "state": "active+clean", "last_scrub_stamp": "2026-05-13T12:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-08T12:00:00.000000+0000"},
+    {"pgid": "1.1",  "state": "active+clean", "last_scrub_stamp": "2026-05-12T08:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-01T12:00:00.000000+0000"},
+    {"pgid": "1.2",  "state": "active+clean", "last_scrub_stamp": "2026-05-14T03:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-25T12:00:00.000000+0000"},
+    {"pgid": "1.3",  "state": "active+clean", "last_scrub_stamp": "2026-05-10T11:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-20T12:00:00.000000+0000"},
+    {"pgid": "1.4",  "state": "active+clean", "last_scrub_stamp": "2026-05-13T18:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-09T12:00:00.000000+0000"},
+    {"pgid": "2.0",  "state": "active+clean", "last_scrub_stamp": "2026-05-14T10:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-11T12:00:00.000000+0000"},
+    {"pgid": "2.1",  "state": "active+clean", "last_scrub_stamp": "2026-05-14T11:00:00.000000+0000", "last_deep_scrub_stamp": "2026-05-12T12:00:00.000000+0000"},
+    {"pgid": "3.0",  "state": "active+clean", "last_scrub_stamp": "2026-05-10T05:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-15T12:00:00.000000+0000"},
+    {"pgid": "3.1",  "state": "active+clean", "last_scrub_stamp": "2026-05-12T07:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-30T12:00:00.000000+0000"},
+    {"pgid": "3.2",  "state": "active+clean", "last_scrub_stamp": "2026-05-09T14:00:00.000000+0000", "last_deep_scrub_stamp": "2026-04-10T12:00:00.000000+0000"}
+  ]
+}

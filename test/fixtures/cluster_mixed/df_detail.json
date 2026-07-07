@@ -1,0 +1,113 @@
+{
+  "stats": {
+    "total_bytes": 264913981440000,
+    "total_used_bytes": 8589934592000,
+    "total_avail_bytes": 256324046848000
+  },
+  "pools": [
+    {
+      "name": "rbd-hdd",
+      "id": 1,
+      "stats": {
+        "stored": 4398046511104,
+        "stored_data": 4398046511104,
+        "stored_omap": 0,
+        "objects": 1100000,
+        "kb_used": 12884901888,
+        "bytes_used": 13194139533312,
+        "percent_used": 0.0498
+      }
+    },
+    {
+      "name": "rbd-ssd",
+      "id": 2,
+      "stats": {
+        "stored": 549755813888,
+        "stored_data": 549755813888,
+        "stored_omap": 0,
+        "objects": 140000,
+        "kb_used": 1610612736,
+        "bytes_used": 1649267441664,
+        "percent_used": 0.0062
+      }
+    },
+    {
+      "name": "ec-archive",
+      "id": 3,
+      "stats": {
+        "stored": 21990232555520,
+        "stored_data": 21990232555520,
+        "stored_omap": 0,
+        "objects": 5500000,
+        "kb_used": 29527214489,
+        "bytes_used": 30236507645952,
+        "percent_used": 0.114
+      }
+    },
+    {
+      "name": "rgw.buckets.index",
+      "id": 4,
+      "stats": {
+        "stored": 8388608,
+        "stored_data": 0,
+        "stored_omap": 8388608,
+        "objects": 131072,
+        "kb_used": 24576,
+        "bytes_used": 25165824,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "paused-bulk",
+      "id": 5,
+      "stats": {
+        "stored": 1073741824,
+        "stored_data": 1073741824,
+        "stored_omap": 0,
+        "objects": 256,
+        "kb_used": 3145728,
+        "bytes_used": 3221225472,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "s3-thumbnails-data",
+      "id": 6,
+      "stats": {
+        "stored": 209715200,
+        "stored_data": 209715200,
+        "stored_omap": 0,
+        "objects": 6400,
+        "kb_used": 614400,
+        "bytes_used": 629145600,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "lightfs-01_meta",
+      "id": 7,
+      "stats": {
+        "stored": 1160000000,
+        "stored_data": 920000000,
+        "stored_omap": 240000000,
+        "objects": 8000,
+        "kb_used": 3398437,
+        "bytes_used": 3480000000,
+        "percent_used": 0.0
+      }
+    },
+    {
+      "name": "lightfs-01_data",
+      "id": 8,
+      "stats": {
+        "stored": 53687091200,
+        "stored_data": 53687091200,
+        "stored_omap": 0,
+        "objects": 12800,
+        "kb_used": 157286400,
+        "bytes_used": 161061273600,
+        "percent_used": 0.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "crush-device-class": "hdd",
+  "crush-failure-domain": "host",
+  "crush-root": "default",
+  "jerasure-per-chunk-alignment": "false",
+  "k": "8",
+  "m": "3",
+  "plugin": "jerasure",
+  "technique": "reed_sol_van"
+}

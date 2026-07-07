@@ -1,0 +1,21 @@
+{
+  "status": "HEALTH_WARN",
+  "checks": {
+    "PG_NOT_DEEP_SCRUBBED": {
+      "severity": "HEALTH_WARN",
+      "summary": {
+        "message": "6 pgs not deep-scrubbed in time",
+        "count": 6
+      },
+      "muted": false
+    },
+    "PG_NOT_SCRUBBED": {
+      "severity": "HEALTH_WARN",
+      "summary": {
+        "message": "2 pgs not scrubbed in time",
+        "count": 2
+      },
+      "muted": false
+    }
+  }
+}

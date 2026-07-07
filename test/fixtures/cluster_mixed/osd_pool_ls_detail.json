@@ -1,0 +1,91 @@
+[
+  {
+    "pool_name": "rbd-hdd",
+    "pool_id": 1,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 0,
+    "pg_num": 512,
+    "erasure_code_profile": ""
+  },
+  {
+    "pool_name": "rbd-ssd",
+    "pool_id": 2,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 128,
+    "erasure_code_profile": ""
+  },
+  {
+    "pool_name": "ec-archive",
+    "pool_id": 3,
+    "type": 3,
+    "size": 11,
+    "min_size": 9,
+    "crush_rule": 2,
+    "pg_num": 256,
+    "erasure_code_profile": "ec-8-3",
+    "pg_autoscale_mode": "warn"
+  },
+  {
+    "pool_name": "rgw.buckets.index",
+    "pool_id": 4,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "application_metadata": { "rgw": {} }
+  },
+  {
+    "pool_name": "paused-bulk",
+    "pool_id": 5,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 0,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "flags_names": "hashpspool,noscrub,nodeep-scrub"
+  },
+  {
+    "pool_name": "s3-thumbnails-data",
+    "pool_id": 6,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "pg_autoscale_mode": "on",
+    "application_metadata": { "rgw": {} }
+  },
+  {
+    "pool_name": "lightfs-01_meta",
+    "pool_id": 7,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 1,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "pg_autoscale_mode": "on",
+    "application_metadata": { "cephfs": { "metadata": "lightfs-01" } }
+  },
+  {
+    "pool_name": "lightfs-01_data",
+    "pool_id": 8,
+    "type": 1,
+    "size": 3,
+    "min_size": 2,
+    "crush_rule": 0,
+    "pg_num": 8,
+    "erasure_code_profile": "",
+    "pg_autoscale_mode": "on",
+    "application_metadata": { "cephfs": { "data": "lightfs-01" } }
+  }
+]

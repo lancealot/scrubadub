@@ -1,0 +1,53 @@
+{
+  "stats": {
+    "total_bytes": 264913981440000,
+    "total_used_bytes": 8589934592000,
+    "total_avail_bytes": 256324046848000
+  },
+  "pools": [
+    {
+      "name": "rbd-hdd",
+      "id": 1,
+      "stats": {
+        "stored": 4398046511104,
+        "objects": 1100000,
+        "kb_used": 12884901888,
+        "bytes_used": 13194139533312,
+        "percent_used": 0.0498
+      }
+    },
+    {
+      "name": "rbd-ssd",
+      "id": 2,
+      "stats": {
+        "stored": 549755813888,
+        "objects": 140000,
+        "kb_used": 1610612736,
+        "bytes_used": 1649267441664,
+        "percent_used": 0.0062
+      }
+    },
+    {
+      "name": "ec-archive",
+      "id": 3,
+      "stats": {
+        "stored": 21990232555520,
+        "objects": 5500000,
+        "kb_used": 29527214489,
+        "bytes_used": 30236507645952,
+        "percent_used": 0.114
+      }
+    },
+    {
+      "name": "legacy-rgw-index",
+      "id": 4,
+      "stats": {
+        "stored": 8388608,
+        "objects": 131072,
+        "kb_used": 24576,
+        "bytes_used": 25165824,
+        "percent_used": 0.0
+      }
+    }
+  ]
+}

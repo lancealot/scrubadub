@@ -1,107 +1,131 @@
-
 ![scrubadub](https://raw.githubusercontent.com/lancealot/scrubadub/assets/scrubadub.png)
 
 # Scrubadub
 
-Scrubadub is a command-line tool that helps Ceph administrators optimize their cluster's scrub settings. It calculates recommended scrub parameters based on your cluster's OSD composition, PG distribution, and workload patterns.
+Scrubadub helps Ceph administrators tune their cluster's scrub settings.
+Run it on a monitor node and it reads your cluster's real state, then
+prints recommended `ceph config set` lines that balance data integrity
+against client impact.
 
-## Why Scrubadub?
+Ceph's defaults are sized for small clusters. On larger or busier ones
+they routinely leave operators staring at `PG_NOT_DEEP_SCRUBBED_IN_TIME`
+warnings. Scrubadub produces starting-point settings tuned for your
+cluster's media mix, PG layout, pool roles, workload, and op scheduler —
+and explains its reasoning.
 
-Ceph's default scrub settings are designed for small clusters. However, larger and more active clusters often fall behind on scrubs when using these defaults. Scrubadub helps you:
+It is a single Bash script. `jq` and the `ceph` CLI are the only
+dependencies, and both already ship on every Ceph node.
 
-- Calculate optimal scrub parameters for your specific cluster
-- Balance data integrity with cluster performance
-- Prevent scrub operations from falling behind
-- Minimize impact on cluster workloads
+## Two modes
 
-## Features
+**Cluster-ingested (`--from-cluster`)** — the default way to run it.
+On a monitor node, scrubadub reads OSD inventory, per-class PG
+distribution, pool sizes and roles, current scrub config, the active op
+scheduler, and the scrub backlog directly via `ceph` + `jq`. No manual
+input required (pass `--workload` to skip the one interactive prompt).
 
-- Comprehensive OSD Analysis:
-  * Supports mixed OSD types (HDD/SSD/NVMe)
-  * Calculates per-device throughput and IOPS
-  * Estimates total cluster performance
-  * Handles varying PG distributions
+**Prompt-driven** — the original off-cluster what-if mode. Answer a few
+questions about OSD counts and workload and it models settings without
+touching a cluster. Handy for planning hardware you don't have yet.
 
-- Intelligent Scrub Scheduling:
-  * Calculates estimated scrub completion times
-  * Automatically adjusts settings to prevent falling behind
-  * Configures optimal scrub time windows
-  * Adapts to cluster size and performance
+## What it does
 
-- Workload Optimization:
-  * Heavy Read: Optimized for read-intensive workloads
-  * Heavy Write: Minimizes impact on write operations
-  * Mixed Use: Balanced for general workloads
-  * Archival: Maximizes scrub efficiency
+- **Cluster ingest.** Reads real OSD/PG/pool/config/scheduler/backlog
+  state from a mon node; refuses to run off a mon unless `--force`.
+- **Scheduler-aware.** Detects WPQ vs mClock and emits only the knobs
+  that scheduler honors — under mClock it suppresses `osd_scrub_sleep` /
+  `osd_scrub_load_threshold` and recommends an `osd_mclock_profile`
+  instead, saying so out loud.
+- **Honest performance model.** Estimates deep- and shallow-scrub
+  completion time against a *binding* ceiling of
+  `min(disk throughput, network)` — network is auto-detected via
+  `ethtool` or set with `--nic-gbps`. Applies a realistic scrub budget
+  (default 10%, tunable). Uses mClock's measured IOPS when present.
+- **Empirical throughput (`--bench-osds`).** Optionally measures real
+  per-OSD throughput via `ceph tell osd.X bench` (one OSD per host per
+  class), flags slow-drive outliers, and caches results per cluster.
+- **Per-class tuning.** On mixed-media WPQ clusters, emits
+  `osd/class:<class>` overrides so NVMe/SSD aren't throttled like HDDs.
+- **Per-pool tuning.** Detects metadata/index pools (CephFS metadata by
+  role, RGW bucket index by name, or OMAP-dominant) and tightens their
+  deep-scrub cadence; flags pools with `noscrub`/`nodeep-scrub` set;
+  flags pools with very large per-PG data.
+- **Correct arithmetic.** Real per-pool PG size and replication/EC
+  overhead (EC k+m read from the authoritative profile), unique-PG vs
+  OSD-assignment counts kept distinct, seconds-typed floats handled.
+- **Safe by default.** Read-only. Prints a backup command and, with
+  `--emit-backup-plan`, a full would-rollback plan. Nothing is applied
+  to the cluster.
 
-- Performance Analysis:
-  * Estimates maximum throughput and IOPS
-  * Predicts scrub completion times
-  * Warns about potential scheduling issues
-  * Suggests optimizations when needed
+## Output modes
 
-- Implementation Support:
-  * Provides clear configuration commands
-  * Includes backup and rollback guidance
-  * Offers monitoring recommendations
-  * Suggests when to re-evaluate settings
+- `--dry-run` — the default; full report, no cluster changes.
+- `--diff` — only the current → proposed delta (numeric-aware, so
+  `86400.000000` and `86400` are not spurious changes).
+- `--why` — a "Reasoning" section explaining each proposed change.
+- `--emit-backup-plan FILE` — write the rollback state as a TSV, then
+  exit (read-only).
 
-## Quick Start
+See [USAGE.md](USAGE.md) for the full flag reference and worked examples.
 
-1. Clone the repository:
+## Quick start
+
+On a monitor node:
+
 ```bash
 git clone https://github.com/lancealot/scrubadub.git
 cd scrubadub
-```
-
-2. Make the script executable:
-```bash
 chmod +x scrubadub.sh
+
+# Read the cluster and print recommendations (read-only):
+./scrubadub.sh --from-cluster --workload mixed
+
+# Just the delta, with reasoning:
+./scrubadub.sh --from-cluster --workload mixed --diff --why
+
+# Override the OSD-node NIC speed if it differs from the mon's:
+./scrubadub.sh --from-cluster --workload mixed --nic-gbps 50
 ```
 
-3. Gather your cluster information:
-```bash
-# Get OSD tree showing device classes
-ceph osd tree --format json-pretty
+Off-cluster planning (no cluster needed):
 
-# Get PG distribution
-ceph pg dump pools --format json-pretty
-
-# Get current scrub settings
-ceph config dump | grep -E 'scrub|osd_max_scrubs'
-```
-
-4. Run the script:
 ```bash
 ./scrubadub.sh
 ```
 
-5. Follow the prompts to input your cluster's information.
+## Requirements
 
-6. Review the analysis output:
-   - Device performance estimates
-   - Expected scrub completion times
-   - Recommended configuration changes
-   - Performance impact warnings
+- **Prompt mode:** Bash (Linux, macOS, or WSL). No other dependencies.
+- **`--from-cluster` mode:** run on a Ceph monitor node with `jq` and a
+  working `ceph` CLI. Both ship with Ceph.
+
+## Testing
+
+`test/smoke.sh` exercises both modes against recorded cluster fixtures —
+no live cluster required:
+
+```bash
+bash test/smoke.sh
+```
+
+Point `CEPH_FIXTURE_DIR` at a fixture directory to run `--from-cluster`
+against canned `ceph` output.
 
 ## Documentation
 
-- [Usage Guide](USAGE.md) - Detailed usage instructions and parameter explanations
-- [Project Plan](projectplan.md) - Technical specifications and implementation details
-
-## Requirements
-
-- Bash shell (Linux, macOS, or Windows with WSL)
-- No additional dependencies
+- [USAGE.md](USAGE.md) — operator-facing usage guide and flag reference.
+- [ROADMAP.md](ROADMAP.md) — completed work and what's planned next
+  (apply/rollback, backlog-drain mode, JSON/YAML output, observability).
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome. The roadmap lists itemized work; pick an item and
+open a PR.
 
 ## Support
 
-If you encounter any issues or have questions, please file an issue on the GitHub repository.
+File an issue on the GitHub repository.

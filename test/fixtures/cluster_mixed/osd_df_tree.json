@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    {"id": 0,  "name": "osd.0",  "device_class": "hdd", "pgs": 95},
+    {"id": 1,  "name": "osd.1",  "device_class": "hdd", "pgs": 100},
+    {"id": 2,  "name": "osd.2",  "device_class": "hdd", "pgs": 102},
+    {"id": 3,  "name": "osd.3",  "device_class": "ssd", "pgs": 80},
+    {"id": 4,  "name": "osd.4",  "device_class": "hdd", "pgs": 98},
+    {"id": 5,  "name": "osd.5",  "device_class": "hdd", "pgs": 101},
+    {"id": 6,  "name": "osd.6",  "device_class": "hdd", "pgs": 99},
+    {"id": 7,  "name": "osd.7",  "device_class": "ssd", "pgs": 82},
+    {"id": 8,  "name": "osd.8",  "device_class": "hdd", "pgs": 96},
+    {"id": 9,  "name": "osd.9",  "device_class": "hdd", "pgs": 105},
+    {"id": 10, "name": "osd.10", "device_class": "hdd", "pgs": 100},
+    {"id": 11, "name": "osd.11", "device_class": "ssd", "pgs": 78}
+  ]
+}
