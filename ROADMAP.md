@@ -479,23 +479,27 @@ otherwise; shows the autoscale mode per pool.
 
 ## Phase 5 — Apply / diff / rollback
 
-### `[ ]` 5.1 `--dry-run` made explicit and default
+### `[x]` 5.1 `--dry-run` made explicit and default
 **Why.** Today's behavior, but unnamed. Naming it lets `--apply` be
 opt-in.
 **Accept.** `scrubadub.sh --dry-run` and `scrubadub.sh` (no flag)
 behave identically.
 
-### `[ ]` 5.2 `--diff`
+### `[x]` 5.2 `--diff`
 **Why.** Show only what's changing.
 **What.** Print one line per parameter where current ≠ proposed; omit
-unchanged.
+unchanged. Numeric-aware comparison so `86400.000000` == `86400`.
 **Accept.** Output is exactly the delta.
 
-### `[ ]` 5.3 `--apply`
+### `[~]` 5.3 `--apply`
 **Why.** Close the loop from "recommendation" to "applied".
 **What.** Take a timestamped backup of current values (via the
 existing backup recipe), prompt for confirmation, then run the
 `ceph config set` lines. Print the rollback command on completion.
+**Prep done.** `--emit-backup-plan FILE` writes the full would-rollback
+state (global + per-class + per-pool) as a TSV, verified against a live
+Reef 18.2.2 cluster. The apply/verify-after-write loop is the remaining
+work.
 **Accept.** Settings change; backup file exists; rollback works.
 
 ### `[ ]` 5.4 `--rollback <backup-file>`
