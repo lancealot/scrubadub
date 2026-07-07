@@ -96,6 +96,12 @@ BENCH_HDD_SAMPLE_COUNT=0
 BENCH_SSD_SAMPLE_COUNT=0
 BENCH_NVME_SAMPLE_COUNT=0
 
+# Per-pool sizing check: flag pools whose average per-PG data exceeds this
+# many GiB. Large PGs make scrub and recovery take proportionally longer.
+# Modern Ceph guidance is roughly 100-500 GiB/PG; >1 TiB is worth flagging.
+LARGE_PG_THRESHOLD_GIB=1024
+declare -a large_pg_pools=()   # populated by ingest_pool_details
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -178,6 +184,10 @@ Tuning options:
                           (min of disk/network) reserved for scrub.
                           Default 10. Drop to 5 on busy clusters, raise
                           to 20-30 on idle ones to catch up backlog.
+  --large-pg-threshold-gib N
+                          Flag pools whose average per-PG data exceeds N
+                          GiB in the sizing-observations section. Default
+                          1024 (1 TiB). Large PGs slow scrub and recovery.
   --device-profile FILE   Source KEY=VALUE overrides for device constants.
                           Keys: HDD_THROUGHPUT, HDD_IOPS, SSD_THROUGHPUT,
                           SSD_IOPS, NVME_THROUGHPUT, NVME_IOPS.
@@ -311,6 +321,13 @@ parse_args() {
             --bench-cache-file)
                 require_value "$1" "${2:-}"
                 BENCH_CACHE_FILE="$2"
+                shift 2 ;;
+            --large-pg-threshold-gib)
+                require_value "$1" "${2:-}"
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    print_error "--large-pg-threshold-gib must be a positive integer"; exit 2
+                fi
+                LARGE_PG_THRESHOLD_GIB="$2"
                 shift 2 ;;
             --device-profile)
                 require_value "$1" "${2:-}"
@@ -1306,7 +1323,9 @@ ingest_pool_details() {
     pools=$(run_ceph osd pool ls detail --format json) || exit 4
     df=$(run_ceph df detail --format json) || exit 4
 
-    # Per-pool rows: name, stored_bytes, pg_num, replica_size, ec_k+m_or_blank
+    # Per-pool rows: name, stored_bytes, pg_num, replica_size, ec_k+m_or_blank,
+    # autoscale_mode. The autoscale mode lives at .pg_autoscale_mode on newer
+    # Ceph, or under .options.pg_autoscale_mode on older; try both.
     pool_rows=$(echo "$pools" "$df" | jq -s -r '
         .[0] as $pools | .[1] as $df
         | $pools[] | . as $p
@@ -1317,9 +1336,10 @@ ingest_pool_details() {
             pg_num: $p.pg_num,
             type: $p.type,                # 1=replicated, 3=erasure
             size: $p.size,                # replica size (or k+m for EC)
-            ec_profile: $p.erasure_code_profile
+            ec_profile: $p.erasure_code_profile,
+            autoscale: ($p.pg_autoscale_mode // $p.options.pg_autoscale_mode // "?")
           }
-        | "\(.name)\t\(.stored)\t\(.pg_num)\t\(.type)\t\(.size)\t\(.ec_profile)"
+        | "\(.name)\t\(.stored)\t\(.pg_num)\t\(.type)\t\(.size)\t\(.ec_profile)\t\(.autoscale)"
     ')
 
     # Walk rows, summing stored and weighted PG-size; pick the largest pool.
@@ -1327,11 +1347,26 @@ ingest_pool_details() {
     local total_pgs=0
     local largest_name="" largest_stored=0 largest_factor_num=3 largest_factor_den=1
     local row_count=0
-    while IFS=$'\t' read -r name stored pg_num ptype psize ec_profile; do
+    large_pg_pools=()
+    local threshold_bytes=$((LARGE_PG_THRESHOLD_GIB * 1073741824))
+    while IFS=$'\t' read -r name stored pg_num ptype psize ec_profile autoscale; do
         [ -z "$name" ] && continue
         row_count=$((row_count + 1))
         total_stored=$((total_stored + stored))
         total_pgs=$((total_pgs + pg_num))
+
+        # Flag pools whose average per-PG data is large. Big PGs make deep
+        # scrub and recovery take proportionally longer, and are the usual
+        # reason a single pool falls behind on scrubs while the rest keep up.
+        if [ "$pg_num" -gt 0 ] && [ "$stored" -gt 0 ]; then
+            local per_pg_bytes=$((stored / pg_num))
+            if [ "$per_pg_bytes" -gt "$threshold_bytes" ]; then
+                # Store GiB (rounded) for display; keep it integer-friendly.
+                local per_pg_gib=$((per_pg_bytes / 1073741824))
+                large_pg_pools+=("$name|$per_pg_gib|$pg_num|${autoscale:-?}")
+            fi
+        fi
+
         # Determine read-overhead factor for this pool.
         local factor_num=3 factor_den=1
         if [ "$ptype" = "3" ]; then
@@ -2048,6 +2083,38 @@ if [ "${#pool_warnings[@]}" -gt 0 ] || [ "${#pool_overrides[@]}" -gt 0 ]; then
         kv="${override#*#}"
         printf "  %-24s %s  (small avg object size → tighten scrub cadence)\n" "$pname" "$kv"
     done
+fi
+
+# Per-pool sizing observations: pools with very large per-PG data. This is
+# advisory, not a config change — scrubadub can't safely resize pools, and
+# a PG split is a heavy rebalance. But large PGs are the usual reason one
+# pool falls behind on scrubs while the rest keep up, so we surface them.
+if [ "${#large_pg_pools[@]}" -gt 0 ]; then
+    print_header "Per-pool sizing observations"
+    echo "Pools with average per-PG data over ${LARGE_PG_THRESHOLD_GIB} GiB. Large PGs make"
+    echo "deep-scrub and recovery take proportionally longer per PG, and reduce"
+    echo "scrub parallelism (fewer PGs to spread across OSDs)."
+    echo
+    printf "  %-40s %12s %8s  %s\n" "POOL" "PER-PG" "PG_NUM" "AUTOSCALE"
+    for entry in "${large_pg_pools[@]}"; do
+        IFS='|' read -r lp_name lp_gib lp_pgnum lp_auto <<< "$entry"
+        # Format per-PG size: show TiB when >= 1024 GiB, else GiB.
+        if [ "$lp_gib" -ge 1024 ]; then
+            lp_disp=$(awk "BEGIN { printf \"%.1f TiB\", $lp_gib / 1024 }")
+        else
+            lp_disp="${lp_gib} GiB"
+        fi
+        printf "  %-40s %12s %8s  %s\n" "$lp_name" "$lp_disp" "$lp_pgnum" "$lp_auto"
+    done
+    echo
+    echo "  Modern Ceph guidance is roughly 100-500 GiB per PG. To reduce PG size:"
+    echo "    - Raise the autoscaler target for denser clusters:"
+    echo "        ceph config set mgr mgr/pg_autoscaler/pgs_per_osd 200   (default 100)"
+    echo "    - Turn AUTOSCALE back 'on' for pools showing 'off' above, or"
+    echo "    - Split a specific pool manually (heavy one-time rebalance):"
+    echo "        ceph osd pool set <pool> pg_num <2x current>"
+    echo "  Do this on a quiet cluster, one pool at a time — a split pauses scrubs"
+    echo "  on backfilling PGs, so the backlog gets worse before it gets better."
 fi
 
 # --why: print the Reasoning section after the diff and overrides

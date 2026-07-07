@@ -62,6 +62,9 @@ Per-class and per-pool overrides (Phase 4):
   `deep_scrub_interval` (3 days) emitted as a `ceph osd pool set`
   override. Indexes / metadata pools should verify integrity more
   often than bulk RBD/EC pools.
+- Pools with average per-PG data over `--large-pg-threshold-gib`
+  (default 1 TiB) get an advisory sizing observation listing per-PG
+  size, `pg_num`, and autoscale mode, with remediation suggestions.
 
 Honest performance model (Phase 3):
 - Network ceiling: scrub-time math now uses
@@ -456,6 +459,21 @@ need different scrub behavior.
 appropriate.
 **Accept.** Pool-scoped lines appear when the cluster has pools of
 distinctly different size/IO profiles.
+
+### `[x]` 4.3 Per-pool sizing observations (large PGs)
+**Why.** Large PGs make deep-scrub and recovery take proportionally
+longer, and are the usual reason a single pool falls behind on scrubs
+while the rest of the cluster keeps up. Surfaced by a real 4.6 PiB
+cluster where one 759 TiB pool at 256 PGs (~3 TiB/PG) accounted for
+all of the late-scrub backlog.
+**What.** Compute average per-PG data (`stored / pg_num`) for each
+pool; flag any over `--large-pg-threshold-gib` (default 1024). List
+per-PG size, `pg_num`, and autoscale mode. Advisory only — scrubadub
+does not resize pools (a PG split is a heavy rebalance). Suggests
+raising `mgr/pg_autoscaler/pgs_per_osd`, re-enabling autoscale, or a
+manual split.
+**Accept.** Section appears when a pool exceeds the threshold, silent
+otherwise; shows the autoscale mode per pool.
 
 ---
 

@@ -390,5 +390,29 @@ check_not "no 'Phase X.Y' in normal output"      "$out" "Phase 0."
 check_not "no 'Phase X.Y' in normal output 2"    "$out" "(Phase 3.5)"
 
 echo
+echo "Test 20: per-pool sizing observations (large PGs)"
+
+# 20a. Silent at default threshold — the fixture's biggest is ec-archive
+# at 80 GiB/PG, well under the 1024 GiB default.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check_not "silent below default 1 TiB threshold"  "$out" "Per-pool sizing observations"
+
+# 20b. Trips when threshold lowered below ec-archive's 80 GiB/PG.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --large-pg-threshold-gib 50 2>&1)
+check     "section appears when tripped"          "$out" "Per-pool sizing observations"
+check     "flags ec-archive at 80 GiB/PG"         "$out" "ec-archive"
+check     "shows the per-PG size"                 "$out" "80 GiB"
+check     "shows the autoscale mode"              "$out" "warn"
+check     "suggests pgs_per_osd bump"             "$out" "mgr/pg_autoscaler/pgs_per_osd 200"
+check_not "small pools not flagged"               "$out" "rbd-ssd"
+
+# 20c. Validation.
+set +e
+out=$("$SB" --large-pg-threshold-gib 0 2>&1); rc=$?
+set -e
+check     "rejects zero threshold"                "$out" "must be a positive integer"
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --large-pg-threshold-gib 0 should exit non-zero"; fail=$((fail + 1)); }
+
+echo
 echo "Results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -27,7 +27,8 @@
     "min_size": 9,
     "crush_rule": 2,
     "pg_num": 256,
-    "erasure_code_profile": "ec-8-3"
+    "erasure_code_profile": "ec-8-3",
+    "pg_autoscale_mode": "warn"
   },
   {
     "pool_name": "rgw.buckets.index",

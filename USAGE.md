@@ -437,6 +437,43 @@ Both per-class and per-pool sections appear only when the cluster
 matches the relevant shape — they're skipped on single-class clusters
 and in prompt mode (which has no pool data).
 
+### Per-pool sizing observations (large PGs)
+
+Under `--from-cluster`, scrubadub computes average per-PG data for each
+pool (`stored / pg_num`) and flags any pool exceeding
+`--large-pg-threshold-gib` (default 1024, i.e. 1 TiB per PG). This is
+**advisory only** — scrubadub does not resize pools, because a PG split
+is a heavy, cluster-wide rebalance that must be planned, not automated.
+
+Why it matters: deep-scrub and recovery time scale with PG size. A pool
+with 3 TiB PGs takes ~6× longer per PG to deep-scrub than one with
+500 GiB PGs, and having fewer, larger PGs also reduces scrub
+parallelism (fewer units to spread across OSDs). The usual symptom is
+one pool falling behind on scrubs (`N pgs not deep-scrubbed in time`)
+while the rest of the cluster keeps up.
+
+The section lists each oversized pool with its per-PG size, `pg_num`,
+and autoscale mode, then suggests three remedies in increasing cost:
+
+1. **Raise the autoscaler target** for dense clusters:
+   `ceph config set mgr mgr/pg_autoscaler/pgs_per_osd 200` (default 100).
+   On clusters with lots of data per OSD, the default 100 PGs/OSD
+   produces large PGs; 150–200 is reasonable above ~10 TiB/OSD.
+2. **Turn `AUTOSCALE` back on** for pools showing `off` — with it off,
+   PG counts don't grow as data grows, which is how pools silently
+   drift into multi-TiB PGs.
+3. **Split a specific pool** manually:
+   `ceph osd pool set <pool> pg_num <2× current>`. Heavy one-time
+   rebalance; do it on a quiet cluster, one pool at a time. A split
+   pauses scrubs on backfilling PGs, so the scrub backlog gets worse
+   before it gets better.
+
+Note the autoscaler and the standalone Ceph PG calculator can disagree:
+the calculator assumes the pool you describe is 100% of the cluster,
+while the autoscaler divides a shared PG budget across all pools by
+their capacity share. On a shared cluster, trust the autoscaler's
+`NEW PG_NUM` from `ceph osd pool autoscale-status`.
+
 ## Best Practices
 
 ### Before Applying Changes
