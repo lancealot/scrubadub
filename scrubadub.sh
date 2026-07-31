@@ -110,6 +110,17 @@ declare -a large_pg_pools=()   # populated by ingest_pool_details
 # osd_scrub_sleep, which is paid per chunk of osd_scrub_chunk_max objects.
 MAX_POOL_WIDTH=0               # cluster mode: from pool walk; prompt mode: DATA_FACTOR_NUM
 AVG_OBJECTS_PER_PG=""          # cluster mode only; empty disables the sleep gate
+declare -a pool_widths=()      # "name|width|pg_num" — populated by ingest_pool_details
+
+# Phase 8.1: reservation sampling.
+RESERVATION_SAMPLE_SIZE=${RESERVATION_SAMPLE_SIZE:-30}
+ADMISSION_LIMITED_PCT=${ADMISSION_LIMITED_PCT:-10}    # P(start) below this => admission-limited
+ADMISSION_TIGHT_PCT=${ADMISSION_TIGHT_PCT:-25}        # ...below this => tight
+reservation_sampled=0     # OSDs that answered
+reservation_at_max=0      # of those, how many were at osd_max_scrubs
+reservation_cap=0         # osd_max_scrubs as reported by the OSDs themselves
+reservation_f_pct=0       # at_max / sampled, as an integer percentage
+reservation_mean=""       # mean slots in use, formatted
 
 # Color codes
 RED='\033[0;31m'
@@ -630,9 +641,16 @@ calculate_scrub_settings() {
         idle_s=$(awk -v o="$AVG_OBJECTS_PER_PG" -v s="$scrub_sleep" \
             'BEGIN { printf "%d", (o / 25) * s }')
         if [ "$idle_s" -gt 300 ]; then
+            # Floor at 0.01s: below that the value buys no meaningful
+            # throttling and just adds per-chunk syscall overhead.
             capped_sleep=$(awk -v o="$AVG_OBJECTS_PER_PG" \
-                'BEGIN { v = 300 * 25 / o; if (v < 0.005) v = 0.0; printf "%.3g", v }')
-            print_notice "Object-dense PGs (~${AVG_OBJECTS_PER_PG} objects/PG): sleep ${scrub_sleep}s would idle ~$((idle_s / 60)) min per PG scrub. Reducing to ${capped_sleep}s." >&2
+                'BEGIN { v = 300 * 25 / o; if (v < 0.01) v = 0; printf "%.3g", v }')
+            if [ "$capped_sleep" = "0" ]; then
+                capped_sleep="0.0"
+                print_notice "Object-dense PGs (~${AVG_OBJECTS_PER_PG} objects/PG): sleep ${scrub_sleep}s would idle ~$((idle_s / 60)) min per PG scrub, and any useful replacement is below 0.01s/chunk. Emitting 0.0." >&2
+            else
+                print_notice "Object-dense PGs (~${AVG_OBJECTS_PER_PG} objects/PG): sleep ${scrub_sleep}s would idle ~$((idle_s / 60)) min per PG scrub. Reducing to ${capped_sleep}s." >&2
+            fi
             scrub_sleep=$capped_sleep
         fi
     fi
@@ -643,6 +661,12 @@ calculate_scrub_settings() {
     # with width when OSDs run near their reservation cap. A narrow start
     # window shrinks the daily admission-attempt surface on top of that.
     # For pools of width >= 11 (EC 8+3 and wider), recommend a 24h window.
+    # TODO(8.1-followup): width alone is a stopgap predicate — the correct
+    # gate is P(start) = (1-f)^width < ADMISSION_TIGHT_PCT using measured
+    # reservation saturation. Width 11 at f=5% admits at 57% (healthy, no
+    # reason to force a 24h window); width 11 at f=40% admits at 0.4%
+    # (dire). Key this on ingest_scrub_reservations' f once sampling data
+    # is reliably available at settings-computation time.
     if [ "${MAX_POOL_WIDTH:-0}" -ge 11 ] && { [ "$begin_hour" != "0" ] || [ "$end_hour" != "0" ]; }; then
         print_notice "Widest pool needs ${MAX_POOL_WIDTH} simultaneous scrub reservations; narrow start windows starve wide-EC scrub admission. Recommending a 24h window (0-0)." >&2
         begin_hour=0
@@ -765,6 +789,16 @@ run_ceph() {
                 local osd_part="${args[1]}"   # "osd.5"
                 local osd_id="${osd_part#osd.}"
                 fixture="bench_osd_${osd_id}.json"
+                [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
+            "tell osd."*" dump_scrub_reservations")
+                # Phase 8.1: reservation fixtures live at
+                # dump_scrub_reservations_osd_<id>.json. Missing file silently
+                # returns non-zero so the caller skips that sample — same
+                # contract as the bench fixtures.
+                local args=($*)
+                local osd_part="${args[1]}"          # "osd.5"
+                local osd_id="${osd_part#osd.}"
+                fixture="dump_scrub_reservations_osd_${osd_id}.json"
                 [ ! -r "$CEPH_FIXTURE_DIR/$fixture" ] && return 1 ;;
             "fsid")
                 fixture="fsid.txt" ;;
@@ -1394,6 +1428,7 @@ ingest_pool_details() {
     local largest_name="" largest_stored=0 largest_factor_num=3 largest_factor_den=1
     local row_count=0
     large_pg_pools=()
+    pool_widths=()
     local threshold_bytes=$((LARGE_PG_THRESHOLD_GIB * 1073741824))
     while IFS=$'\t' read -r name stored pg_num ptype psize ec_profile autoscale; do
         [ -z "$name" ] && continue
@@ -1452,6 +1487,10 @@ ingest_pool_details() {
         if [ "$factor_num" -gt "${MAX_POOL_WIDTH:-0}" ]; then
             MAX_POOL_WIDTH=$factor_num
         fi
+
+        # Phase 8.1: keep every pool's reservation width for the
+        # per-pool admission-feasibility table.
+        pool_widths+=("$name|$factor_num|$pg_num")
     done <<< "$pool_rows"
 
     # Compute weighted average PG size in GB.
@@ -1612,6 +1651,143 @@ ingest_scrub_backlog() {
     scrub_late=$(echo "$health" | jq -r '.checks.PG_NOT_SCRUBBED.summary.count // 0')
 
     backlog_summary="${total_pgs} PGs total; ${scrub_late} past scrub interval; ${deep_late} past deep-scrub interval"
+}
+
+# -----------------------------------------------------------------------------
+# Phase 8.1: scrub admission feasibility
+# -----------------------------------------------------------------------------
+# A scrub of a width-W PG requires ALL W acting-set members to have a free scrub
+# slot at the same instant. Slots are per-OSD and shared between "local" (this
+# OSD is the scrub primary) and "remote" (this OSD is granting a reservation for
+# someone else's scrub). With f = fraction of OSDs currently at osd_max_scrubs:
+#
+#     P(a width-W scrub can start) = (1 - f)^W
+#
+# The exponent is why wide EC pools starve while replicated pools on the SAME
+# OSDs scrub normally. Measured on a Reef 18.2.2 cluster at f = 24.2%:
+#
+#     width  3 (3x replicated)  -> 43.5%
+#     width  5 (5x replicated)  -> 25.0%
+#     width 11 (EC 8+3)         ->  4.7%
+#     width 20 (EC 16+4)        ->  0.39%
+#
+# A 112x spread across pools sharing one slot pool. On that cluster it produced
+# a 4.9% tail of PGs that had not deep-scrubbed in 49-65 days while the cluster
+# as a whole was meeting its 28-day policy on average.
+#
+# CAVEAT 1 -- independence. (1-f)^W assumes independent occupancy. Real clusters
+# are more clustered than that: remote grants arrive W-1 at a time and CRUSH
+# correlates placement. The reference cluster measured ~1.7x more clustered than
+# Poisson. Treat the output as a diagnostic ranking, not a predictor.
+#
+# CAVEAT 2 -- f is an EQUILIBRIUM property, not a headroom measure. Raising
+# osd_max_scrubs admits more PGs, occupancy rises, and f returns to roughly
+# where it started. A flat f under a rising cap means the added capacity is
+# being CONSUMED, not wasted. Never judge a cap change by delta-f. Judge it by
+# delta-completions/day (Phase 8.2). Measured on the reference cluster:
+#     cap 5 -> 8 :  mean 2.73 -> 5.45,  f 24.2% -> 30.3%  (f did not improve)
+# Completions in a CONFOUNDED window on the same cluster (cap change and a
+# client-load drop landed within 3h of each other) went 261/day -> 366/day —
+# the right METRIC to watch, but that gain is not attributable to the cap; a
+# matched-load comparison was still pending when this landed.
+# -----------------------------------------------------------------------------
+# P(start) = (1 - f)^W, as a percentage. Bash has no floats; awk does.
+_p_start_pct() {
+    awk -v f="$1" -v w="$2" 'BEGIN { printf "%.2f", (1 - f/100.0)^w * 100 }'
+}
+
+ingest_scrub_reservations() {
+    reservation_sampled=0
+    reservation_at_max=0
+    reservation_cap=0
+    local df ids
+    df=$(run_ceph osd df tree --format json) || return 1
+    ids=$(echo "$df" | jq -r '[.nodes[] | select(.type=="osd") | .id] | .[]')
+    [ -z "$ids" ] && return 1
+    # Stride across the id space rather than taking the first N, so one unhappy
+    # host cannot dominate the estimate.
+    local -a all=()
+    while read -r id; do [ -n "$id" ] && all+=("$id"); done <<< "$ids"
+    local total=${#all[@]} step
+    step=$(( total / RESERVATION_SAMPLE_SIZE ))
+    [ "$step" -lt 1 ] && step=1
+    local sum=0 i=0 out l r c
+    while [ "$i" -lt "$total" ]; do
+        local id="${all[$i]}"
+        i=$((i + step))
+        # Down OSDs and timeouts fail here; skipping them is correct — they hold
+        # no reservations and are not part of the admission population.
+        out=$(run_ceph tell "osd.$id" dump_scrub_reservations 2>/dev/null) || continue
+        l=$(echo "$out" | jq -r '.scrubs_local     // empty' 2>/dev/null)
+        r=$(echo "$out" | jq -r '.scrubs_remote    // empty' 2>/dev/null)
+        c=$(echo "$out" | jq -r '.osd_max_scrubs   // empty' 2>/dev/null)
+        { [ -z "$l" ] || [ -z "$r" ] || [ -z "$c" ]; } && continue
+        reservation_sampled=$((reservation_sampled + 1))
+        sum=$((sum + l + r))
+        reservation_cap=$c
+        [ $((l + r)) -ge "$c" ] && reservation_at_max=$((reservation_at_max + 1))
+    done
+    [ "$reservation_sampled" -eq 0 ] && return 1
+    reservation_f_pct=$(( reservation_at_max * 100 / reservation_sampled ))
+    reservation_mean=$(awk -v s="$sum" -v n="$reservation_sampled" \
+        'BEGIN { printf "%.2f", s/n }')
+    return 0
+}
+
+report_admission_feasibility() {
+    [ "$reservation_sampled" -eq 0 ] && return 0
+    print_header "Scrub admission feasibility"
+    echo "  Sampled ${reservation_sampled} OSDs via 'dump_scrub_reservations'"
+    echo "  osd_max_scrubs (reported by OSDs) : ${reservation_cap}"
+    echo "  Mean slots in use                 : ${reservation_mean} of ${reservation_cap}"
+    echo "  OSDs at cap (f)                   : ${reservation_at_max}/${reservation_sampled} = ${reservation_f_pct}%"
+    echo
+    echo "  A width-W PG needs all W acting-set members below cap at the same"
+    echo "  instant:  P(start) = (1 - f)^W"
+    echo
+    if [ "${#pool_widths[@]}" -eq 0 ]; then
+        print_notice "No pool widths available; run with --from-cluster for per-pool detail."
+        return 0
+    fi
+    printf "  %-34s %6s %10s   %s\n" "pool" "width" "P(start)" "assessment"
+    local limited=0 seen_wide=0 row name width pg_num p verdict
+    for row in "${pool_widths[@]}"; do
+        IFS='|' read -r name width pg_num <<< "$row"
+        [ -z "$width" ] || [ "$width" -lt 1 ] && continue
+        p=$(_p_start_pct "$reservation_f_pct" "$width")
+        if awk -v p="$p" -v t="$ADMISSION_LIMITED_PCT" 'BEGIN{exit !(p < t)}'; then
+            verdict="ADMISSION-LIMITED"; limited=$((limited + 1))
+        elif awk -v p="$p" -v t="$ADMISSION_TIGHT_PCT" 'BEGIN{exit !(p < t)}'; then
+            verdict="tight"
+        else
+            verdict="ok"
+        fi
+        [ "$width" -ge 11 ] && seen_wide=1
+        printf "  %-34s %6s %9s%%   %s\n" "$name" "$width" "$p" "$verdict"
+    done
+    if [ "$limited" -gt 0 ]; then
+        echo
+        print_warning "${limited} pool(s) are admission-limited at the current saturation."
+        echo "  These pools are gated by reservation admission, not by scrub bandwidth."
+        echo "  Lengthening osd_deep_scrub_interval or raising osd_max_scrubs will NOT"
+        echo "  fix them: the interval is not the binding constraint, and raising the"
+        echo "  cap admits proportionally more contenders, leaving f roughly unchanged."
+        echo
+        echo "  What does move the number:"
+        echo "    - reduce demand-side synchronisation (osd_scrub_interval_randomize_ratio"
+        echo "      well above the 0.5 default creates eligibility storms that inflate f)"
+        echo "    - widen the scrub window (begin/end_hour 0/0) to maximise admission attempts"
+        echo "    - shorten per-PG scrub time so slots free faster (PG count on the heavy pools)"
+        echo "    - narrower EC profile, if the pool is being designed rather than operated"
+        echo
+        echo "  To confirm whether a cap change helped, compare deep-scrub COMPLETIONS"
+        echo "  per day before and after. Do not compare f — see Phase 8.2."
+    fi
+    if [ "$seen_wide" -eq 1 ]; then
+        echo
+        print_notice "(1-f)^W assumes independent slot occupancy. Real placement is more"
+        print_notice "clustered, so treat these as a ranking between pools, not a forecast."
+    fi
 }
 
 # Phase 1.5: render proposed settings as a current → proposed diff.
@@ -1891,6 +2067,7 @@ if [ "$FROM_CLUSTER" -eq 1 ]; then
     ingest_scheduler              # 1.6
     ingest_current_config         # 1.5
     ingest_scrub_backlog          # 1.7
+    ingest_scrub_reservations || print_notice "Reservation sampling unavailable; skipping admission analysis."   # 8.1
 
     if [ -z "$WORKLOAD_TYPE" ]; then
         echo
@@ -2146,6 +2323,11 @@ if [ "$FROM_CLUSTER" -eq 1 ] && [ -n "$backlog_summary" ]; then
     print_header "Scrub Backlog (from 'ceph health detail')"
     echo "  $backlog_summary"
 fi
+
+# Phase 8.1: admission feasibility — rendered before the proposed settings,
+# because an admission-limited verdict changes what the recommendations can
+# and cannot fix.
+[ "$FROM_CLUSTER" -eq 1 ] && report_admission_feasibility
 
 # Phase 1.5: current → proposed diff in cluster mode.
 if [ "$FROM_CLUSTER" -eq 1 ]; then

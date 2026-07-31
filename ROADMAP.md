@@ -617,17 +617,31 @@ bandwidth-shaped. The starved tail scrubs *faster* than the healthy
 population (max 1,280s vs 70,442s): those PGs are not slow, sick, or
 interrupted — they lose the admission lottery.
 
-### `[ ]` 8.1 Reservation-feasibility ingest
-**What.** Sample `dump_scrub_reservations` across ~30 OSDs, compute
-`f` (fraction at cap), report per-pool `P(start) = (1−f)^width` using
-the acting-set width already tracked (`MAX_POOL_WIDTH` machinery).
-Below ~10%: state plainly that the pool's deep-scrub cadence is
-admission-limited and interval/cap tuning will not fix it.
+### `[x]` 8.1 Reservation-feasibility ingest
+**What.** Sample `dump_scrub_reservations` across ~30 OSDs (strided
+over the id space so one unhappy host cannot dominate), compute `f`
+(fraction at cap), report per-pool `P(start) = (1−f)^width` from the
+pool walk's `pool_widths`. Below `ADMISSION_LIMITED_PCT` (default
+10%): the pool is admission-limited and the report says plainly that
+interval/cap tuning will not fix it, lists what does (demand
+de-synchronisation, wider window, smaller PGs, narrower EC), and
+points cap-change evaluation at completions/day. `tight` band below
+`ADMISSION_TIGHT_PCT` (default 25%). All thresholds and the sample
+size are env-tunable.
 **Semantics.** `f` and `P(start)` are point-in-time diagnostics only.
-Never emit "lever exhausted" or any cap-change verdict keyed to Δf.
-**Status.** Patch offered by the operator who built the model; wiring
-(fixtures for `tell osd.N dump_scrub_reservations`, smoke tests)
-lands with it.
+No cap-change verdict is keyed to Δf; the code comments carry both
+model caveats (independence; f-as-equilibrium) and label the
+reference cluster's completions example as confounded pending the
+matched-load comparison.
+**Status.** Landed — patch contributed by the operator who built the
+model, from live `dump_scrub_reservations` output on the reference
+cluster. Down/unresponsive OSDs are skipped (they hold no
+reservations and are not part of the admission population); absent
+data degrades to a notice, never an error. Fixtures:
+`dump_scrub_reservations_osd_<id>.json`, same missing-file contract
+as the bench fixtures. Smoke tests 22–26 cover f=0, the wide-EC
+starvation thesis at f=30%, no-data, partial sampling, and prompt
+mode.
 
 ### `[ ]` 8.2 Measured scrub model, per device class
 **What.** Under `--from-cluster`, read `last_scrub_duration` and

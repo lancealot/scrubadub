@@ -38,11 +38,25 @@ In `--from-cluster` mode scrubadub adds these sections to the report:
 1. **Scrub Backlog** — total PG count and how many are past their
    scrub / deep-scrub interval, read from `ceph health detail`
    (`PG_NOT_(DEEP_)SCRUBBED_IN_TIME`).
-2. **Proposed Changes** — each recommended parameter rendered as
+2. **Scrub admission feasibility** — samples `dump_scrub_reservations`
+   across ~30 OSDs, measures `f` (the fraction of OSDs at their
+   `osd_max_scrubs` reservation cap), and reports per-pool
+   `P(start) = (1−f)^width`, where width is k+m for EC and replica
+   size for replicated pools. A deep scrub must hold reservations on
+   all width members simultaneously, so admission collapses
+   exponentially with pool width — this is why wide EC pools can
+   starve on scrubs while replicated pools on the same OSDs stay
+   current. Pools below 10% are flagged **ADMISSION-LIMITED**, with
+   what actually moves the number (interval and cap tuning do not).
+   Two caveats printed with it: the formula assumes independent slot
+   occupancy (treat it as a ranking, not a forecast), and `f` is an
+   equilibrium property — never judge a cap change by whether `f`
+   moved; judge it by deep-scrub completions per day.
+3. **Proposed Changes** — each recommended parameter rendered as
    `current → proposed`, highlighting only what would change.
-3. **Per-class / per-pool overrides** — scheduler and pool-scoped
+4. **Per-class / per-pool overrides** — scheduler and pool-scoped
    recommendations where the cluster's shape calls for them.
-4. **Per-pool sizing observations** — pools with very large per-PG data.
+5. **Per-pool sizing observations** — pools with very large per-PG data.
 
 Use `--diff` to print only the delta and exit, `--why` to add a
 reasoning section, and `--emit-backup-plan FILE` to write the

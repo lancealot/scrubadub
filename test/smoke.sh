@@ -425,7 +425,10 @@ check     "flags ec-archive at 80 GiB/PG"         "$out" "ec-archive"
 check     "shows the per-PG size"                 "$out" "80 GiB"
 check     "shows the autoscale mode"              "$out" "warn"
 check     "suggests pgs_per_osd bump"             "$out" "mgr/pg_autoscaler/pgs_per_osd 200"
-check_not "small pools not flagged"               "$out" "rbd-ssd"
+# Scope to the sizing section: the admission-feasibility table (Test 22+)
+# legitimately lists every pool, including rbd-ssd.
+sizing_section=$(echo "$out" | sed -n '/Per-pool sizing observations/,/Do this on a quiet/p')
+check_not "small pools not flagged"               "$sizing_section" "rbd-ssd"
 
 # 20c. Validation.
 set +e
@@ -443,11 +446,18 @@ out=$(AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 calculate_scrub_settings 10 250 3 200
 check     "cap allows computed max_scrubs of 3"     "$out" "osd_max_scrubs = 3"
 
 # 21b. Sleep gated on object density: at 965k objects/PG, bucket sleep 0.1
-# would idle (965000/25)*0.1 ≈ 64 min per PG scrub; gate scales it to ≤300s.
+# would idle (965000/25)*0.1 ≈ 64 min per PG scrub. The computed replacement
+# (~0.0078s) is under the 0.01s floor, so the gate emits 0.0 outright.
 out=$(AVG_OBJECTS_PER_PG=965000 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
       calculate_scrub_settings 10 100 3 24 wpq 2>&1)
-check     "dense PGs: sleep scaled down"            "$out" "osd_scrub_sleep = 0.00"
+check     "very dense PGs: sleep floored to zero"   "$out" "osd_scrub_sleep = 0.0"
+check     "floor explains itself"                   "$out" "Emitting 0.0"
 check     "sleep gate explains itself"              "$out" "would idle"
+
+# Moderately dense: replacement lands above the floor and is kept as-is.
+out=$(AVG_OBJECTS_PER_PG=200000 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>&1)
+check     "dense PGs: sleep scaled, above floor"    "$out" "osd_scrub_sleep = 0.0375"
 
 # Sparse PGs keep the bucket value untouched.
 out=$(AVG_OBJECTS_PER_PG=5000 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
@@ -473,6 +483,53 @@ check     "deep interval emitted on global"         "$out" "ceph config set glob
 check     "max interval emitted on global"          "$out" "ceph config set global osd_scrub_max_interval 604800"
 check     "deep interval still emitted on osd"      "$out" "ceph config set osd osd_deep_scrub_interval 604800"
 check_not "min interval NOT emitted on global"      "$out" "ceph config set global osd_scrub_min_interval"
+
+echo
+echo "Test 22: admission feasibility — healthy cluster (f=0)"
+# cluster_mclock's reservation fixtures all sit below cap.
+out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "section renders"                         "$out" "Scrub admission feasibility"
+check     "f computed as zero"                      "$out" "= 0%"
+check_not "no pool admission-limited at f=0"        "$out" "ADMISSION-LIMITED"
+check_not "no admission warning at f=0"             "$out" "admission-limited at the current saturation"
+
+echo
+echo "Test 23: admission feasibility — the thesis (f=30%, wide EC starves)"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "f computed from at-cap fraction"         "$out" "3/10 = 30%"
+check     "mean occupancy reported"                 "$out" "Mean slots in use                 : 2.70 of 5"
+check     "EC 8+3 (width 11) admission-limited"     "$out" "1.98%   ADMISSION-LIMITED"
+check     "replicated (width 3) ok on same OSDs"    "$out" "34.30%   ok"
+check     "admission warning fires"                 "$out" "admission-limited at the current saturation"
+check     "warning names the non-fixes"             "$out" "raising osd_max_scrubs will NOT"
+check     "warning points at completions metric"    "$out" "compare deep-scrub COMPLETIONS"
+check     "independence caveat prints for wide"     "$out" "ranking between pools, not a forecast"
+
+echo
+echo "Test 24: admission feasibility — no reservation data at all"
+NORES=$(mktemp -d /tmp/scrubadub-nores.XXXXXX)
+cp "$FIXTURE"/*.json "$FIXTURE"/*.txt "$NORES"/ 2>/dev/null
+rm -f "$NORES"/dump_scrub_reservations_osd_*.json
+set +e
+out=$(CEPH_FIXTURE_DIR="$NORES" "$SB" --from-cluster --workload mixed 2>&1); rc=$?
+set -e
+check     "sampling-unavailable notice prints"      "$out" "Reservation sampling unavailable"
+check_not "section absent without data"             "$out" "Scrub admission feasibility"
+[ "$rc" -eq 0 ] && pass=$((pass + 1)) || { echo "  FAIL: missing reservation data must not change exit code (got $rc)"; fail=$((fail + 1)); }
+rm -rf "$NORES"
+
+echo
+echo "Test 25: admission feasibility — partial sampling (down OSDs)"
+# cluster_mixed has 12 OSDs but reservation fixtures for only 10 (6 and 9
+# simulate down OSDs). Sampling must reflect only the OSDs that answered.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "sampled count excludes down OSDs"        "$out" "Sampled 10 OSDs"
+
+echo
+echo "Test 26: admission feasibility — prompt mode untouched"
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
+check_not "prompt mode: no admission section"       "$out" "Scrub admission feasibility"
+check_not "prompt mode: no sampling notice"         "$out" "Reservation sampling unavailable"
 
 echo
 echo "Results: $pass passed, $fail failed"
