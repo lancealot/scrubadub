@@ -112,7 +112,8 @@ Carries over from Phase 0:
 - Scheduler-aware: detects WPQ vs mClock and suppresses settings
   mClock ignores; recommends an `osd_mclock_profile` under mClock.
 - `osd_scrub_sleep` seconds-typed (floats); `osd_max_scrubs` capped
-  at 2 (3 with `--aggressive-scrubs`).
+  at 3 (4 with `--aggressive-scrubs`) — recalibrated in Phase 8 to
+  match the default shipped in current Reef.
 - `osd_scrub_interval_randomize_ratio = 0.5` emitted to avoid
   synchronized scrub storms.
 - Replication / EC factor honored via `--replica-size` / `--ec-ratio`.
@@ -562,6 +563,133 @@ scrub-correlated client latency.
 **What.** Dashboard with scrub-age histograms, `osd_max_scrubs`
 utilization, and headroom against `osd_deep_scrub_interval`.
 **Accept.** JSON imports cleanly into Grafana 10+.
+
+---
+
+## Phase 8 — Admission-aware scrub model
+
+Born from a live investigation on a 4.7 PiB Reef 18.2.2 / WPQ cluster
+(831 OSDs, 5216 PGs, EC 16+4 bulk pools) whose deep-scrub tail could
+not be explained by bandwidth: the cluster met its 28-day cycle *on
+average* while a ~5% tail of wide-EC PGs starved past the 49-day
+warning threshold.
+
+**The model.** A deep scrub must hold reservations on ALL acting-set
+members simultaneously. Local and remote reservations draw from one
+shared per-OSD pool (`osd_max_scrubs`); an EC k+m scrub consumes 1
+local + (k+m−1) remote slots. With `f` = fraction of OSDs at their
+reservation cap, per-attempt admission is roughly
+`P(start) = (1−f)^width`. At the measured f=24.2%:
+
+| Pool type | Width | P(start) | vs EC 16+4 |
+|---|---|---|---|
+| 3x replicated | 3 | 43.5% | 112x |
+| 5x replicated | 5 | 25.0% | 64x |
+| EC 8+3 | 11 | 4.7% | 12x |
+| EC 16+4 | 20 | 0.39% | 1x |
+
+Two separable penalties: linear (20 slots vs 5 = 4x) and exponential
+(the conjunction = 64x). scrubadub modeled the 1.25x read
+amplification from `(k+m)/k` and discarded the `(k+m)` that bites.
+
+**Model caveats (carry into all code comments):**
+- `(1−f)^width` assumes independence. Measured occupancy is ~1.7x
+  more clustered than Poisson (remote grants arrive (k+m−1) at a
+  time; CRUSH correlates placement). It is a diagnostic *ranking*,
+  not a predictor.
+- **`f` is an equilibrium property, NOT a headroom measure.** Raising
+  the cap admits more PGs, occupancy rises, and `f` settles back near
+  where it started — a flat `f` under a rising cap means added
+  capacity is being *consumed*, not wasted. The test for whether a
+  cap change helped is Δcompletions/day from `last_deep_scrub_stamp`
+  histograms (8.2's machinery), never Δf. An earlier "lever exhausted"
+  conclusion keyed on flat `f` was withdrawn on exactly this ground.
+- Squid's reservation queuing is NOT a clean fix: it shipped with an
+  mClock-specific field regression (perpetual queuing; tracker #69078)
+  and an escape hatch (`osd_scrub_disable_reservation_queuing`).
+  Upgrade advice must be scheduler-conditional and validate-first.
+
+**Ground truth from the source cluster (calibration data for 8.2/8.3):**
+deep-scrub durations on EC 16+4 HDD pools (n=1352): p50 3.16h,
+p90 8.27h, max 19.57h — an effective 2–12 MiB/s per shard, 4–8x
+slower than a bandwidth model predicts. Per-PG scrub rate is not
+bandwidth-shaped. The starved tail scrubs *faster* than the healthy
+population (max 1,280s vs 70,442s): those PGs are not slow, sick, or
+interrupted — they lose the admission lottery.
+
+### `[ ]` 8.1 Reservation-feasibility ingest
+**What.** Sample `dump_scrub_reservations` across ~30 OSDs, compute
+`f` (fraction at cap), report per-pool `P(start) = (1−f)^width` using
+the acting-set width already tracked (`MAX_POOL_WIDTH` machinery).
+Below ~10%: state plainly that the pool's deep-scrub cadence is
+admission-limited and interval/cap tuning will not fix it.
+**Semantics.** `f` and `P(start)` are point-in-time diagnostics only.
+Never emit "lever exhausted" or any cap-change verdict keyed to Δf.
+**Status.** Patch offered by the operator who built the model; wiring
+(fixtures for `tell osd.N dump_scrub_reservations`, smoke tests)
+lands with it.
+
+### `[ ]` 8.2 Measured scrub model, per device class
+**What.** Under `--from-cluster`, read `last_scrub_duration` and
+`last_deep_scrub_stamp` from `pg dump`; compute per-class capacity as
+achievable-concurrency × measured-duration percentiles, with pools
+mapped to classes via CRUSH rule. Completions/day histograms from the
+stamps double as the before/after instrument for any cap or interval
+change. Replaces (not refines) the bandwidth estimate in cluster
+mode; subsumes part of E.1.
+
+### `[ ]` 8.3 Derive `deep_interval` from measured capacity
+**What.** `max(7d, measured_cycle × ~1.3)` instead of the current
+constant 604800 (assigned once, never adjusted). For the source
+cluster this lands near its actual 28d policy — the honest answer.
+Also emit the `mon_warn_pg_not_deep_scrubbed_ratio` implication
+(warn threshold = interval × (1 + ratio)) so operators see the real
+alarm line.
+
+### `[ ]` 8.4 Cap-change evaluation guidance
+**What.** When a cap change is contemplated, instruct measurement by
+Δcompletions/day over a matched-load window (8.2's histograms), with
+explicit warning that `f` will NOT move and is not the success
+metric. **Blocked on:** the source cluster's controlled
+cap=8-at-full-load experiment (baseline 251–270 deep-scrubs/day at
+cap=2-at-full-load; >350/day ⇒ the cap does real work at load and
+shorter intervals become policy options; ~260/day ⇒ the earlier gain
+was the quiet period, not the cap).
+
+### `[x]` 8.5 Quick fix: emit mgr-visible intervals on `global`
+`osd_deep_scrub_interval` / `osd_scrub_max_interval` are now emitted
+on BOTH `osd` and `global`: the mgr evaluates
+PG_NOT_(DEEP_)SCRUBBED against its own view (tracker #44959), which a
+who=osd override never reaches — while emitting only `global` would
+be silently overridden for OSD daemons wherever an osd-section row
+already exists. The backup plan captures both sections' prior state.
+
+### `[x]` 8.6 Quick fix: cap recalibrated to 3 (4 aggressive)
+Matches the `osd_max_scrubs` default in current Reef (PR #55173);
+the old cap of 2 was a downgrade there. Per-host concurrency product
+demoted to an advisory — on wide-EC pools the binding constraint is
+reservation admission, not spindle load.
+
+### `[x]` 8.7 Quick fix: object-density gate on `osd_scrub_sleep`
+Sleep is paid per chunk (`osd_scrub_chunk_max`, default 25 objects):
+per-PG idle = (objects/25) × sleep. At ~965k objects/PG, 0.1s of
+sleep = ~64 minutes of pure idling per scrub. Cluster mode now
+computes real objects/PG and scales sleep so idle stays ≤ ~5 min.
+
+### `[x]` 8.8 Quick fix: width-aware scrub window
+Narrow start windows shrink the daily admission-attempt surface —
+`begin/end_hour` gate scrub *starts*, so for a width-20 PG that wins
+its conjunction ~0.4% of the time, attempts are the scarce resource.
+Pools of width ≥ 11 now get a 24h (0-0) window recommendation with
+the reasoning printed.
+
+**References.**
+- Clyso, *Slow Scrub and Deep Scrub* — reservation mechanics for wide EC.
+- Ceph docs, *Scrub internals — Scrub Reservations* (Pacific dev docs).
+- Ceph tracker #44959 — deep-scrub warning evaluated against the mgr's copy.
+- Ceph PR #55173 — Reef `osd_max_scrubs` default raised to 3.
+- Ceph tracker #69078 — Squid `osd_scrub_disable_reservation_queuing`
+  as temporary workaround for mClock reservation-queuing regression.
 
 ---
 

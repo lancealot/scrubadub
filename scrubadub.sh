@@ -102,6 +102,15 @@ BENCH_NVME_SAMPLE_COUNT=0
 LARGE_PG_THRESHOLD_GIB=1024
 declare -a large_pg_pools=()   # populated by ingest_pool_details
 
+# Phase 8: admission-aware inputs (see ROADMAP Phase 8).
+# MAX_POOL_WIDTH: widest acting set across pools (k+m for EC, size for
+# replicated). A deep scrub must reserve slots on all `width` members at
+# once, so this is the conjunction width that drives scrub admission.
+# AVG_OBJECTS_PER_PG: real object density (cluster mode), used to price
+# osd_scrub_sleep, which is paid per chunk of osd_scrub_chunk_max objects.
+MAX_POOL_WIDTH=0               # cluster mode: from pool walk; prompt mode: DATA_FACTOR_NUM
+AVG_OBJECTS_PER_PG=""          # cluster mode only; empty disables the sleep gate
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -177,7 +186,8 @@ Tuning options:
   --hyperconverged        Other workloads share the OSD hosts (Proxmox,
                           OpenStack co-located VMs, etc.). Allows lower
                           osd_scrub_load_threshold values under WPQ.
-  --aggressive-scrubs     Permit osd_max_scrubs up to 3 (default cap: 2).
+  --aggressive-scrubs     Permit osd_max_scrubs up to 4 (default cap: 3,
+                          matching the default in current Reef).
                           Verify per-host headroom before using.
   --scrub-budget-percent N
                           Integer 1-100. Share of the binding ceiling
@@ -588,19 +598,55 @@ calculate_scrub_settings() {
         print_notice "Estimated deep-scrub time exceeds 3 days. Raising osd_max_scrubs." >&2
     fi
 
-    # Cap max_scrubs (Phase 0.3).
-    local cap=2
-    [ "$AGGRESSIVE_SCRUBS" -eq 1 ] && cap=3
+    # Cap max_scrubs (Phase 0.3, recalibrated in Phase 8). Default cap is 3,
+    # matching the osd_max_scrubs default shipped in current Reef (ceph PR
+    # #55173) — the old cap of 2 was a downgrade on those clusters. The
+    # per-host concurrency product below is an advisory, not the cap's
+    # justification: on wide-EC pools the binding constraint is reservation
+    # admission, not spindle load (see ROADMAP Phase 8).
+    local cap=3
+    [ "$AGGRESSIVE_SCRUBS" -eq 1 ] && cap=4
     if [ "$max_scrubs" -gt "$cap" ]; then
         print_warning "osd_max_scrubs computed as $max_scrubs; capped at $cap." >&2
         if [ "$AGGRESSIVE_SCRUBS" -ne 1 ]; then
-            print_warning "Use --aggressive-scrubs to allow up to 3 after reviewing per-host headroom." >&2
+            print_warning "Use --aggressive-scrubs to allow up to 4 after reviewing per-host headroom." >&2
         fi
         max_scrubs=$cap
     fi
     if [ "$max_scrubs" -gt 1 ]; then
         print_warning "Per-host scrub concurrency = osd_max_scrubs($max_scrubs) × OSDs_per_host." >&2
         print_warning "Verify your hosts can absorb that before applying." >&2
+    fi
+
+    # Phase 8 quick fix: object-density gate on scrub sleep. Sleep applies
+    # per scrub chunk (osd_scrub_chunk_max, default 25 objects), so per-PG
+    # idle time = (objects / 25) × sleep. At ~965k objects/PG a 0.1s sleep
+    # adds ~64 minutes of pure idling to every scrub. When real object
+    # density is known (cluster mode), scale sleep so per-PG idle stays
+    # ≤ ~300s; values under 0.005s round to 0.
+    if [ -n "${AVG_OBJECTS_PER_PG:-}" ] && [ "${AVG_OBJECTS_PER_PG:-0}" -gt 0 ] \
+       && [ "$scrub_sleep" != "0.0" ]; then
+        local idle_s capped_sleep
+        idle_s=$(awk -v o="$AVG_OBJECTS_PER_PG" -v s="$scrub_sleep" \
+            'BEGIN { printf "%d", (o / 25) * s }')
+        if [ "$idle_s" -gt 300 ]; then
+            capped_sleep=$(awk -v o="$AVG_OBJECTS_PER_PG" \
+                'BEGIN { v = 300 * 25 / o; if (v < 0.005) v = 0.0; printf "%.3g", v }')
+            print_notice "Object-dense PGs (~${AVG_OBJECTS_PER_PG} objects/PG): sleep ${scrub_sleep}s would idle ~$((idle_s / 60)) min per PG scrub. Reducing to ${capped_sleep}s." >&2
+            scrub_sleep=$capped_sleep
+        fi
+    fi
+
+    # Phase 8 quick fix: width-aware scrub window. A deep scrub must hold
+    # reservations on ALL acting-set members simultaneously — for EC k+m
+    # that is a (k+m)-way conjunction, and P(start) collapses exponentially
+    # with width when OSDs run near their reservation cap. A narrow start
+    # window shrinks the daily admission-attempt surface on top of that.
+    # For pools of width >= 11 (EC 8+3 and wider), recommend a 24h window.
+    if [ "${MAX_POOL_WIDTH:-0}" -ge 11 ] && { [ "$begin_hour" != "0" ] || [ "$end_hour" != "0" ]; }; then
+        print_notice "Widest pool needs ${MAX_POOL_WIDTH} simultaneous scrub reservations; narrow start windows starve wide-EC scrub admission. Recommending a 24h window (0-0)." >&2
+        begin_hour=0
+        end_hour=0
     fi
 
     local values="$min_interval,$max_interval,$deep_interval,$max_scrubs,$randomize_ratio,$begin_hour,$end_hour,$scrub_sleep,$load_threshold,$mclock_profile"
@@ -1398,6 +1444,14 @@ ingest_pool_details() {
             largest_factor_num=$factor_num
             largest_factor_den=$factor_den
         fi
+
+        # Phase 8: track the widest pool. factor_num is the acting-set
+        # width — k+m for EC, replica size for replicated. A deep scrub
+        # must reserve slots on all `width` members at once, so this is
+        # the conjunction width that drives scrub-admission probability.
+        if [ "$factor_num" -gt "${MAX_POOL_WIDTH:-0}" ]; then
+            MAX_POOL_WIDTH=$factor_num
+        fi
     done <<< "$pool_rows"
 
     # Compute weighted average PG size in GB.
@@ -1429,10 +1483,12 @@ ingest_pool_details() {
     pool_overrides=()
     pool_warnings=()
     local pool_row
+    local total_objects=0
     # Non-whitespace separator: tab-IFS collapses empty fields, which
     # mis-aligns rows whose `flags_names` is null.
     while IFS='|' read -r pname stored objects flags is_hot; do
         [ -z "$pname" ] && continue
+        total_objects=$((total_objects + objects))
         if [[ "$flags" == *noscrub* ]] || [[ "$flags" == *nodeep-scrub* ]]; then
             pool_warnings+=("$pname: $flags  (scrubbing disabled by pool flag)")
         fi
@@ -1482,7 +1538,14 @@ ingest_pool_details() {
         | "\($p.pool_name)|\($st)|\($obj)|\($flags)|\($hot)"
     ')
 
-    print_notice "Pools: $row_count; total stored: $((total_stored / 1073741824)) GB; avg PG size: $AVG_PG_SIZE GB"
+    # Phase 8: real object density, for the scrub-sleep gate. Sleep is paid
+    # per chunk (osd_scrub_chunk_max objects), so objects/PG — not bytes —
+    # is what prices it.
+    if [ "${total_unique_pgs:-0}" -gt 0 ] && [ "$total_objects" -gt 0 ]; then
+        AVG_OBJECTS_PER_PG=$((total_objects / total_unique_pgs))
+    fi
+
+    print_notice "Pools: $row_count; total stored: $((total_stored / 1073741824)) GB; avg PG size: $AVG_PG_SIZE GB; avg objects/PG: ${AVG_OBJECTS_PER_PG:-unknown}"
 }
 
 # Phase 1.6: read scheduler from the cluster.
@@ -1733,13 +1796,24 @@ build_backup_plan() {
     config_dump=$(run_ceph config dump --format json) || exit 4
 
     # 1. Global OSD config (proposed_settings entries: "key = value").
-    local setting name current
+    local setting name current gcurrent
     for setting in "${proposed_settings[@]}"; do
         name="${setting% = *}"
         current=$(echo "$config_dump" | jq -r --arg n "$name" '
             [.[] | select(.section=="osd" and .name==$n and ((.mask // "")==""))][0].value // empty')
         [ -z "$current" ] && current="<unset>"
         printf "osd\tosd\t\t%s\t%s\n" "$name" "$current" >> "$out_file"
+        # The two health-check-relevant intervals are also applied on the
+        # 'global' section (mgr visibility) — capture that section's prior
+        # state too so rollback can undo both writes.
+        case "$name" in
+            osd_deep_scrub_interval|osd_scrub_max_interval)
+                gcurrent=$(echo "$config_dump" | jq -r --arg n "$name" '
+                    [.[] | select(.section=="global" and .name==$n and ((.mask // "")==""))][0].value // empty')
+                [ -z "$gcurrent" ] && gcurrent="<unset>"
+                printf "osd\tglobal\t\t%s\t%s\n" "$name" "$gcurrent" >> "$out_file"
+                ;;
+        esac
     done
 
     # 2. Per-class overrides (class_overrides entries: "osd/class:<class>|<key> = <value>").
@@ -2054,6 +2128,10 @@ done
 # Capture the scrub window for the Notes section (Phase 0.2-aware).
 read -r display_begin display_end <<< "$(scrub_window_for_workload "$WORKLOAD_TYPE")"
 
+# Prompt mode has no pool walk; the declared data factor's numerator IS the
+# acting-set width (k+m for --ec-ratio, size for --replica-size).
+[ "$MAX_POOL_WIDTH" -eq 0 ] && MAX_POOL_WIDTH=$DATA_FACTOR_NUM
+
 # Collect proposed settings once so we can render both a diff and the apply commands.
 proposed_settings=()
 while IFS= read -r line; do
@@ -2182,7 +2260,20 @@ echo "  > ceph_scrub_settings_backup_\$(date +%Y%m%d_%H%M%S).txt"
 print_header "Recommended Configuration Commands"
 echo "# Run these on your cluster to apply the recommended settings:"
 for setting in "${proposed_settings[@]}"; do
-    echo "ceph config set osd ${setting// = / }"
+    param="${setting% = *}"
+    case "$param" in
+        osd_deep_scrub_interval|osd_scrub_max_interval)
+            # The mgr evaluates PG_NOT_DEEP_SCRUBBED / PG_NOT_SCRUBBED
+            # against ITS OWN view of these intervals; a who=osd override
+            # is invisible to the mgr, so the health checks keep firing on
+            # the default (tracker #44959). Set both: 'osd' so the OSDs
+            # honor it even where an osd-section row already exists, and
+            # 'global' so the mgr's health math agrees.
+            echo "ceph config set osd ${setting// = / }"
+            echo "ceph config set global ${setting// = / }" ;;
+        *)
+            echo "ceph config set osd ${setting// = / }" ;;
+    esac
 done
 # Phase 4.1: per-class overrides (entity is osd/class:<class>).
 for override in "${class_overrides[@]}"; do

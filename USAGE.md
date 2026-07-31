@@ -396,6 +396,33 @@ If you need to tighten further, Squid+ has `osd_scrub_max_concurrent_per_host`;
 on older releases the practical equivalent is `osd_max_scrubs=1` plus
 a tight `osd_scrub_begin_hour`/`osd_scrub_end_hour` window.
 
+### Admission-aware adjustments (wide EC clusters)
+
+A deep scrub must hold scrub reservations on **all** acting-set members
+simultaneously — for an EC k+m pool that is a (k+m)-way conjunction.
+On clusters where many OSDs run near their reservation cap, admission
+probability collapses exponentially with pool width: an EC 16+4 PG can
+be ~60x less likely to start than a 5x-replicated PG on the same OSDs.
+Three recommendations account for this (full modelling lands with
+ROADMAP Phase 8):
+
+- **`osd_max_scrubs` cap is 3** (4 with `--aggressive-scrubs`),
+  matching the default in current Reef. The per-host concurrency
+  product above is an advisory, not the cap's justification.
+- **Scrub window**: pools of width ≥ 11 (EC 8+3 and wider) get a 24h
+  (`0`/`0`) window. `begin/end_hour` gate scrub *starts*, so a narrow
+  window shrinks the daily admission-attempt surface — and for
+  hard-to-admit wide-EC PGs, attempts are the scarce resource.
+- **`osd_scrub_sleep` is priced by object density** in cluster mode.
+  Sleep is paid per chunk (`osd_scrub_chunk_max`, default 25 objects);
+  at ~1M objects/PG a 0.1s sleep adds over an hour of pure idle per
+  PG scrub, so scrubadub scales it to keep per-PG idle under ~5 min.
+
+Separately, `osd_deep_scrub_interval` and `osd_scrub_max_interval` are
+emitted on **both** `osd` and `global`: the mgr evaluates the
+`PG_NOT_(DEEP_)SCRUBBED` health checks against its own view of these
+values, which a `who=osd` override never reaches.
+
 ## Per-class and per-pool overrides
 
 Beyond the global `osd_*` settings, scrubadub emits two extra kinds of

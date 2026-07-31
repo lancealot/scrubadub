@@ -250,12 +250,16 @@ echo "Test 16: Phase 5.3-prep — --emit-backup-plan"
 PLAN=$(mktemp /tmp/scrubadub-backup-plan.XXXXXX.tsv)
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --emit-backup-plan "$PLAN" 2>&1)
 check     "writer confirms success"                  "$out" "Backup plan written to"
-check     "row count reported"                       "$out" "(12 rows)"
+check     "row count reported"                       "$out" "(14 rows)"
 plan_body=$(grep -v '^#' "$PLAN")
 check     "global osd row captures current value"    "$plan_body" "osd	osd		osd_deep_scrub_interval	1209600"
 check     "global row records current sleep"         "$plan_body" "osd	osd		osd_scrub_sleep	0.0"
 check     "per-class row records unset"              "$plan_body" "osd_class	osd	class:ssd	osd_scrub_sleep	<unset>"
 check     "per-pool row records unset"               "$plan_body" "pool	pool	rgw.buckets.index	deep_scrub_interval	<unset>"
+# The two health-check intervals are also applied on 'global' (mgr
+# visibility); the plan captures that section's prior state separately.
+check     "global-section row for deep interval"     "$plan_body" "osd	global		osd_deep_scrub_interval	<unset>"
+check     "global-section row for max interval"      "$plan_body" "osd	global		osd_scrub_max_interval	<unset>"
 
 # Header block is self-describing.
 check     "backup file has restore comment"          "$(cat "$PLAN")" "scrubadub.sh --rollback"
@@ -429,6 +433,46 @@ out=$("$SB" --large-pg-threshold-gib 0 2>&1); rc=$?
 set -e
 check     "rejects zero threshold"                "$out" "must be a positive integer"
 [ "$rc" -ne 0 ] && pass=$((pass + 1)) || { echo "  FAIL: --large-pg-threshold-gib 0 should exit non-zero"; fail=$((fail + 1)); }
+
+echo
+echo "Test 21: Phase 8 quick fixes (admission-aware adjustments)"
+
+# 21a. Cap recalibrated to 3 (Reef default). Density >200 (+1 → 2) plus
+# scrub-time >168h (+1 → 3) now lands at 3 uncapped; old cap clipped to 2.
+out=$(AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 calculate_scrub_settings 10 250 3 200 wpq 2>/dev/null)
+check     "cap allows computed max_scrubs of 3"     "$out" "osd_max_scrubs = 3"
+
+# 21b. Sleep gated on object density: at 965k objects/PG, bucket sleep 0.1
+# would idle (965000/25)*0.1 ≈ 64 min per PG scrub; gate scales it to ≤300s.
+out=$(AVG_OBJECTS_PER_PG=965000 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>&1)
+check     "dense PGs: sleep scaled down"            "$out" "osd_scrub_sleep = 0.00"
+check     "sleep gate explains itself"              "$out" "would idle"
+
+# Sparse PGs keep the bucket value untouched.
+out=$(AVG_OBJECTS_PER_PG=5000 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>/dev/null)
+check     "sparse PGs: bucket sleep kept"           "$out" "osd_scrub_sleep = 0.1"
+
+# 21c. Width-aware window: at width 20 (EC 16+4) a Heavy-Read window of
+# 1-6 collapses to 0-0; at width 3 (replicated) the bucket window stands.
+out=$(MAX_POOL_WIDTH=20 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 1 24 wpq 2>&1)
+check     "width 20: window widened to 0-0 (begin)" "$out" "osd_scrub_begin_hour = 0"
+check     "width 20: window widened to 0-0 (end)"   "$out" "osd_scrub_end_hour = 0"
+check     "window gate explains itself"             "$out" "simultaneous scrub reservations"
+out=$(MAX_POOL_WIDTH=3 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 1 24 wpq 2>/dev/null)
+check     "width 3: bucket window kept"             "$out" "osd_scrub_begin_hour = 1"
+
+# 21d. Cluster mode: window gate fires via the fixture's EC 8+3 (width 11),
+# and the two mgr-visible intervals are emitted on BOTH osd and global.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "fixture width 11 triggers window gate"   "$out" "Widest pool needs 11 simultaneous scrub reservations"
+check     "deep interval emitted on global"         "$out" "ceph config set global osd_deep_scrub_interval 604800"
+check     "max interval emitted on global"          "$out" "ceph config set global osd_scrub_max_interval 604800"
+check     "deep interval still emitted on osd"      "$out" "ceph config set osd osd_deep_scrub_interval 604800"
+check_not "min interval NOT emitted on global"      "$out" "ceph config set global osd_scrub_min_interval"
 
 echo
 echo "Results: $pass passed, $fail failed"
