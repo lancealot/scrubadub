@@ -115,7 +115,9 @@ against canned `ceph` output.
 
 - [USAGE.md](USAGE.md) — operator-facing usage guide and flag reference.
 - [ROADMAP.md](ROADMAP.md) — completed work and what's planned next
-  (apply/rollback, backlog-drain mode, JSON/YAML output, observability).
+  (measured scrub capacity, backlog-drain mode, JSON/YAML output,
+  observability). scrubadub is advisory by design — it never writes to
+  a cluster.
 
 ## License
 

@@ -120,7 +120,8 @@ Carries over from Phase 0:
 - Scrub-time estimate uses `SCRUB_BUDGET_PERCENT` (default 10%).
 - Device baselines refreshed and overridable via `--device-profile`.
 - Prompt mode preserved as the default for off-cluster modeling.
-- Still no `--apply` / `--diff` / `--rollback`; Phase 5 adds them.
+- `--diff` landed in Phase 5; `--apply` / `--rollback` were
+  deliberately dropped — scrubadub stays advisory (see Phase 5).
 
 ---
 
@@ -130,8 +131,11 @@ Carries over from Phase 0:
 - **Detect, don't assume.** Read the cluster's real state; ask the
   operator only when the cluster can't answer.
 - **Both schedulers supported.** WPQ and mClock are first-class.
-- **Reversible by default.** Always print a backup command; never apply
-  without explicit consent and a rollback path.
+- **Advisory, never operative.** scrubadub does not write to clusters.
+  It prints recommendations, explains the reasoning, and emits a
+  rollback plan; a human decides and applies. The Phase 8 findings are
+  the justification — the correct moves were counterintuitive often
+  enough that an unattended tool would have made clusters worse.
 - **Be honest about what we don't know.** Banners on default assumptions
   (PG size, device baselines, scrub budget fraction) — silent-wrong is
   worse than loud-uncertain.
@@ -500,26 +504,44 @@ behave identically.
 unchanged. Numeric-aware comparison so `86400.000000` == `86400`.
 **Accept.** Output is exactly the delta.
 
-### `[~]` 5.3 `--apply`
-**Why.** Close the loop from "recommendation" to "applied".
-**What.** Take a timestamped backup of current values (via the
-existing backup recipe), prompt for confirmation, then run the
-`ceph config set` lines. Print the rollback command on completion.
-**Prep done.** `--emit-backup-plan FILE` writes the full would-rollback
-state (global + per-class + per-pool) as a TSV, verified against a live
-Reef 18.2.2 cluster. The apply/verify-after-write loop is the remaining
-work.
-**Accept.** Settings change; backup file exists; rollback works.
+### `[-]` 5.3 `--apply` — DROPPED (scrubadub stays advisory)
+### `[-]` 5.4 `--rollback <backup-file>` — DROPPED with 5.3
+### `[-]` 5.5 `--yes` for non-interactive use — DROPPED with 5.3
 
-### `[ ]` 5.4 `--rollback <backup-file>`
-**Why.** Two-button operation: forward and back.
-**What.** Replay the backup as `ceph config set` lines.
-**Accept.** After `--apply` then `--rollback`, `ceph config dump`
-matches the pre-apply state.
+**Decision (operator, after the Phase 8 investigation): scrubadub does
+not write to clusters. It prints, explains, and leaves a human in the
+loop.**
 
-### `[ ]` 5.5 `--yes` for non-interactive use
-**Why.** Automation.
-**Accept.** Pairs with `--apply` and skips the confirmation.
+The Phase 8 work is the argument. Every correct move on the reference
+cluster was the opposite of the naive reading:
+
+- `osd_scrub_interval_randomize_ratio` — a value 14x the default was
+  *protective*; lowering it to the documented default would have
+  doubled demand on a saturated cluster (8.10).
+- `osd_deep_scrub_randomize_ratio` — the fix was **down**, and it
+  makes total deep-scrub throughput *fall* while the cluster gets
+  healthier (8.9).
+- `osd_max_scrubs` — +43% throughput but it did **not** clear the
+  tail, and it made per-attempt admission worse (8.4).
+- `osd_deep_scrub_interval` — a 28-day interval, 4x the default, was
+  correct and load-bearing; shortening it would have invalidated the
+  demand lever entirely (8.9a floor check).
+
+A tool that applied its own recommendations unattended would have
+gotten at least two of those backwards, on a 4.7 PiB production
+cluster, with confidence. The recommendations are good *inputs to a
+human decision*; they are not yet good enough to be actions. Revisit
+only if the model is validated across several clusters of different
+shapes — n=1 is exactly how the wrong generalizations got in.
+
+**What survives, and is enough.** The read-only path already gives
+operators everything needed to act deliberately:
+`--dry-run` (default), `--diff`, `--why`, the copy-pasteable
+`ceph config set` block, and `--emit-backup-plan FILE`, which writes
+the complete would-rollback state (global + per-class + per-pool,
+verified against a live Reef 18.2.2 cluster). An operator can capture
+rollback state, apply by hand, and revert from the plan — with a
+human reading the reasoning at each step.
 
 ---
 
@@ -537,7 +559,8 @@ remind the operator to re-run after the backlog drains.
 ### `[ ]` 6.2 `--evaluate` mode
 **Why.** Close the feedback loop. Compare the model's prediction to
 reality.
-**What.** Run N days after `--apply`; compare expected vs actual
+**What.** Run N days after the operator applies changes by hand;
+compare expected vs actual
 scrub-age distribution; suggest refinements (`SCRUB_BUDGET_FRACTION`
 adjustment, per-class tweaks).
 **Accept.** Produces a delta report; suggests at least one tuning
