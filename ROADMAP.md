@@ -643,6 +643,87 @@ as the bench fixtures. Smoke tests 22–26 cover f=0, the wide-EC
 starvation thesis at f=30%, no-data, partial sampling, and prompt
 mode.
 
+### `[~]` 8.9 Demand-side model — `osd_deep_scrub_randomize_ratio`
+**The highest-measured-impact lever found in the whole investigation,
+and Phase 8 was missing it entirely** — 8.1–8.8 are all supply-side
+(admission); this is demand-side.
+
+`osd_deep_scrub_randomize_ratio` (default 0.15) is the fraction of
+*shallow*-scrub attempts randomly upgraded to deep. Total deep demand:
+
+    attempt_cadence      = osd_scrub_min_interval x (2 + osd_scrub_interval_randomize_ratio) / 2
+    shallow_attempts/day = PGs / attempt_cadence
+    deep_demand/day      = PGs / osd_deep_scrub_interval                    # deadline path
+                         + shallow_attempts/day x osd_deep_scrub_randomize_ratio   # random path
+
+On the reference cluster (5216 PGs, min_interval 1d, interval ratio
+7.0 → 4.5d cadence, deep interval 28d): random path 174/day + deadline
+186/day = **360/day against 388/day measured capacity = 0.93x**.
+**48% of deep scrubs were on PGs that did not need one**, competing
+for the same 20-way reservations as PGs 65 days stale. Setting the
+ratio to 0.05 drops demand to 244/day (0.63x).
+
+**Result: 252 → 145 PGs overdue (≥49d) in 37 hours — 42% of the tail
+cleared**, against a no-improvement decay baseline of 8%; net
+clearance 68–80/day vs a random share of 24/day (2.8–3.3x).
+
+**Why the tail benefits disproportionately (new mechanism).** At
+P(start) ≈ 0.08% every attempt is a near-certain failure, so *which*
+PG a primary selects is irrelevant — outcomes are decided by luck
+across thousands of attempts. At ≈3.9% a primary that picks its
+most-overdue PG actually converts. **Primary-side ordering only bites
+once admission probability is high enough.** This is the causal link
+between lowering demand and preferentially clearing the tail, and it
+explains why the cap (throughput ↑, `f` unchanged) did not clear the
+tail while the demand-side fix did. It also fits queueing intuition:
+0.93x → 0.63x is a move off the saturation knee, where small load
+reductions produce outsized latency improvements — which is why a
+~4.6% change in total slot-hours produced a 42% tail improvement.
+
+**Expected side effects — must ship with the recommendation, or the
+fix reads as a regression:** deep-scrub concurrency fell 794 → 496
+(−38%), shallow flat (371 → 388), active+clean +281. **Total
+deep-scrub throughput FALLS.** The success metric is tail clearance
+(p99 / max age), not completions/day.
+
+**To implement.** (a) Compute `deep_demand/day` and report the
+random-path fraction explicitly — "48% of your deep scrubs are
+randomly-triggered early scrubs" is the sentence that makes the fix
+obvious; the demand half needs no new ingest beyond reading the
+ratio. (b) Gate the *recommendation* on `demand/capacity > ~0.8` AND
+any pool admission-limited per 8.1 — the capacity denominator is
+8.2's. (c) Emit the side-effects note alongside.
+
+**Direction is counterintuitive and must be stated: for wide-EC
+clusters, both randomize ratios move DOWN, and the interval one must
+not move down at all** (see 8.10).
+
+### `[x]` 8.10 Correction: never lower `osd_scrub_interval_randomize_ratio` blind
+scrubadub shipped `randomize_ratio = 0.5` unconditionally, plus
+`--why` text calling a high value "above the valid maximum of 1.0"
+and "likely the dominant cause of scrub backlog", plus (in 8.1's own
+warning) advice to lower it. **All three were wrong**, and wrong in
+the direction that hurts exactly the clusters 8.1 diagnoses.
+
+Mean attempt cadence is `min_interval x (2 + ratio)/2`, so *lowering*
+the ratio *raises* the attempt rate. On the reference cluster the
+achieved scrub cadence (~16.9d) was already 3.8x slower than the
+scheduled attempt cadence (4.5d) — attempt rate was never the
+constraint. Moving 7.0 → 0.5 would have taken deep demand from 0.93x
+to **2.09x** capacity: more unservable attempts, higher `f`, lower
+P(start). **On an admission-limited cluster a high ratio is
+protective**, and whoever set 7.0 was likely right.
+
+Now: the `--why` text explains the cadence relationship and the
+protective case and drops the unverified "valid maximum" claim (`ceph
+config set` accepted 7.0 and reports it `mon`-sourced, suggesting no
+schema max — to be confirmed via `ceph config help`); 8.1's warning
+names `osd_deep_scrub_randomize_ratio` as the real demand lever and
+explicitly flags lowering the interval ratio as NOT a fix; and
+`calculate_scrub_settings` preserves a higher current value whenever
+reservation sampling shows the widest pool below
+`ADMISSION_TIGHT_PCT`. Absent sampling data, prior behaviour stands.
+
 ### `[ ]` 8.2 Measured scrub model, per device class
 **What.** Under `--from-cluster`, read `last_scrub_duration` and
 `last_deep_scrub_stamp` from `pg dump`; compute per-class capacity as
@@ -660,15 +741,28 @@ Also emit the `mon_warn_pg_not_deep_scrubbed_ratio` implication
 (warn threshold = interval × (1 + ratio)) so operators see the real
 alarm line.
 
-### `[ ]` 8.4 Cap-change evaluation guidance
+### `[~]` 8.4 Cap-change evaluation guidance — experiment resolved
 **What.** When a cap change is contemplated, instruct measurement by
-Δcompletions/day over a matched-load window (8.2's histograms), with
-explicit warning that `f` will NOT move and is not the success
-metric. **Blocked on:** the source cluster's controlled
-cap=8-at-full-load experiment (baseline 251–270 deep-scrubs/day at
-cap=2-at-full-load; >350/day ⇒ the cap does real work at load and
-shorter intervals become policy options; ~260/day ⇒ the earlier gain
-was the quiet period, not the cap).
+Δcompletions/day over a **matched-load** window (8.2's histograms),
+with explicit warning that `f` will NOT move and is not the success
+metric.
+**Result (matched load, single fresh-mgr snapshot, censoring-corrected
+uniformly):** cap=2 at 5.5 GiB/s → **272/day**; cap=8 at 5.4 GiB/s →
+**388/day** = **+43%**. The earlier confound is closed: the fresh mgr
+reproduced the cap=2 baseline within 4% of the old mgr's 251–270/day,
+so staleness was not a factor. Elasticity ≈ 0.26, roughly constant
+across 2→5→8, with no knee reached — elasticity ≈ 0 would mean
+bandwidth-limited, ≈ 1.0 slot-limited without contention; ~0.26 is the
+conjunction signature. Secondary confirmation: cap=2 completion
+buckets were sub-Poisson (sd 3.1 vs 7.7 predicted) — the statistical
+signature of a hard rate limit.
+**The distinction that must ship with it:** raising the cap increased
+aggregate throughput but did **not** clear the tail, and at cap=8 `f`
+rose 24.2% → 30.3%, so per-attempt P(start) at width 20 got *worse*
+(0.39% → 0.080%). Cap ↑ buys completions/day; demand ↓ buys admission
+probability and tail clearance. Different levers, different symptoms —
+recommending the cap for a tail problem is a category error.
+**Remaining:** encode the guidance text. See 8.6 note on cap ceiling.
 
 ### `[x]` 8.5 Quick fix: emit mgr-visible intervals on `global`
 `osd_deep_scrub_interval` / `osd_scrub_max_interval` are now emitted
@@ -683,6 +777,16 @@ Matches the `osd_max_scrubs` default in current Reef (PR #55173);
 the old cap of 2 was a downgrade there. Per-host concurrency product
 demoted to an advisory — on wide-EC pools the binding constraint is
 reservation admission, not spindle load.
+**Open (8.4 follow-up):** measured evidence from one wide-EC cluster
+supports 5–8 there (+43% completions, elasticity 0.26, no knee). Not
+adopted as a blanket default: that is an n=1 result on a 831-OSD
+wide-EC cluster, and a cap of 8 on a narrow-pool cluster with few
+OSDs per host buys no admission benefit (P(start) is already high)
+while multiplying per-host client impact. The right encoding is a
+*conditional* ceiling — raise only when pools are wide AND admission
+is limited AND per-host headroom exists — which needs 8.1's `f` and
+8.2's completions in the same decision. Until then, `--aggressive-scrubs`
+remains the operator's escape hatch.
 
 ### `[x]` 8.7 Quick fix: object-density gate on `osd_scrub_sleep`
 Sleep is paid per chunk (`osd_scrub_chunk_max`, default 25 objects):
@@ -697,8 +801,62 @@ its conjunction ~0.4% of the time, attempts are the scarce resource.
 Pools of width ≥ 11 now get a 24h (0-0) window recommendation with
 the reasoning printed.
 
+### `[ ]` 8.11 Cheap detectors surfaced by the investigation
+Small, independent, each a thing that had to be found by hand:
+- **`max` deep-scrub age as the earliest structural-blockage
+  detector** — it would have fired ~7 weeks before the health warning
+  on the reference cluster. Alert on it.
+- **Report the effective warning threshold in days**
+  (`interval x (1 + mon_warn_pg_not_deep_scrubbed_ratio)`, = 49d
+  there) and label the overdue count a **lagging** indicator: inflow
+  is set by the scrub pattern one threshold-period ago, so the count
+  can keep rising for weeks after a successful fix.
+- **Bimodality**: `p95/p50` ≈ 1.9 in a healthy regime; 5.2x means two
+  populations. Report the ratio, flag > ~3x.
+- **Percentile selection**: which percentile gates the warning depends
+  on the overdue fraction — at 2.78% overdue the warning tracks
+  p97–p98, so p99 is the gating stat, not p95. Compute
+  `overdue/total` and pick accordingly.
+- **Forced-scrub futility** (Phase 6 input): `ceph pg deep-scrub` sets
+  `must_deep_scrub` and jumps the *primary's* queue, and requested
+  scrubs get higher op priority once started (PR #14488) — but
+  admission is decided by *replicas*, which never see the flag. A
+  sweep of ~225 forced PGs cleared 1 PG in 38 minutes, exactly the
+  random share. Forcing is not useless (flags persist and convert
+  once `f` drops) but it is not a fast intervention: **force, then fix
+  admission — never force to clear a backlog.** A drain mode built on
+  `ceph pg deep-scrub` loops will appear to hang.
+- **EC pgid shard suffix**: `pg dump` gives `29.6fd`, admin sockets
+  give `29.6fds0`. Exact-match jq selects fail silently — use
+  `startswith()` for admin-socket PG matching.
+- **`mon_health_max_detail` (default 50) truncates the `detail` array**
+  of `ceph health detail`, so any pool breakdown derived from it is a
+  sample, not a census. scrubadub is **not** affected today (backlog
+  reads `.checks.*.summary.count`, which is the true count) — but 8.2
+  must take per-pool breakdowns from `pg dump`, never from health
+  detail, and should warn if it ever parses the truncated list.
+
+### `[ ]` 8.12 PG sizing for wide EC: per-shard, not per-PG
+The current large-PG check thresholds on bytes-per-PG. For wide EC
+the operative quantity is **GiB per shard** (`per-PG / k`) and the
+scrub duration it implies, because **length and width multiply**: a
+196.8 GiB shard takes 1.1–5.6h, so the 20-way reservation must hold
+for hours rather than minutes, and any interruption restarts from
+zero *without updating the stamp*. Under low P(start) such PGs have
+near-zero chance of an uninterrupted run.
+
+Evidence: on the reference cluster all three PGs older than 90 days
+(147d, 126d, 116d) were in the largest-shard pool (196.8 GiB/shard,
+1.67M objects/PG) despite it having the *fewest* PGs; their acting
+sets showed no OSD concentration (57 distinct OSDs across 60 shard
+slots, chance predicted 2.4 repeats vs 3 observed) — not hardware.
+**Design rule to encode: size PGs so a deep scrub completes in well
+under an hour.** This binds hard at 20 TB+ drives.
+
 **References.**
 - Clyso, *Slow Scrub and Deep Scrub* — reservation mechanics for wide EC.
+- Ceph tracker #62669 — replicas rejecting scrub reserve requests.
+- Ceph PR #14488 — requested scrubs get higher op priority (once started).
 - Ceph docs, *Scrub internals — Scrub Reservations* (Pacific dev docs).
 - Ceph tracker #44959 — deep-scrub warning evaluated against the mgr's copy.
 - Ceph PR #55173 — Reef `osd_max_scrubs` default raised to 3.

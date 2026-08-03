@@ -629,6 +629,25 @@ calculate_scrub_settings() {
         print_warning "Verify your hosts can absorb that before applying." >&2
     fi
 
+    # Phase 8.9: do not lower osd_scrub_interval_randomize_ratio on a cluster
+    # whose scrubs are admission-limited. Mean attempt cadence is
+    # min_interval x (2 + ratio)/2, so lowering the ratio RAISES the attempt
+    # rate. On the reference cluster, moving 7.0 -> 0.5 would have taken deep
+    # demand from 0.93x measured capacity to 2.09x — more unservable attempts,
+    # higher f, lower P(start). A high ratio is protective there. Only act when
+    # reservation sampling shows the widest pool is NOT admission-constrained.
+    if [ "${reservation_sampled:-0}" -gt 0 ] && [ "${MAX_POOL_WIDTH:-0}" -ge 1 ]; then
+        local cur_rand="${current_osd_scrub_interval_randomize_ratio:-}"
+        local widest_p
+        widest_p=$(_p_start_pct "${reservation_f_pct:-0}" "$MAX_POOL_WIDTH")
+        if [[ "$cur_rand" =~ ^[0-9.]+$ ]] \
+           && awk -v c="$cur_rand" -v p="$randomize_ratio" 'BEGIN{exit !(c > p)}' \
+           && awk -v p="$widest_p" -v t="$ADMISSION_TIGHT_PCT" 'BEGIN{exit !(p < t)}'; then
+            print_notice "Widest pool admits at ${widest_p}% per attempt; keeping osd_scrub_interval_randomize_ratio at ${cur_rand} rather than lowering it to ${randomize_ratio} — lowering raises the attempt rate on a cluster that already cannot admit what it generates." >&2
+            randomize_ratio="$cur_rand"
+        fi
+    fi
+
     # Phase 8 quick fix: object-density gate on scrub sleep. Sleep applies
     # per scrub chunk (osd_scrub_chunk_max, default 25 objects), so per-PG
     # idle time = (objects / 25) × sleep. At ~965k objects/PG a 0.1s sleep
@@ -1774,11 +1793,20 @@ report_admission_feasibility() {
         echo "  cap admits proportionally more contenders, leaving f roughly unchanged."
         echo
         echo "  What does move the number:"
-        echo "    - reduce demand-side synchronisation (osd_scrub_interval_randomize_ratio"
-        echo "      well above the 0.5 default creates eligibility storms that inflate f)"
+        echo "    - REDUCE DEEP-SCRUB DEMAND. osd_deep_scrub_randomize_ratio (default 0.15)"
+        echo "      is the fraction of shallow-scrub attempts randomly upgraded to deep."
+        echo "      On a saturated cluster that can be ~half of all deep scrubs, spent on"
+        echo "      PGs that did not need one, competing for slots against genuinely"
+        echo "      overdue PGs. Lowering it (e.g. 0.15 -> 0.05) is the highest-impact"
+        echo "      lever measured so far. Expect total deep-scrub throughput to FALL —"
+        echo "      the goal is tail clearance, not completions/day."
         echo "    - widen the scrub window (begin/end_hour 0/0) to maximise admission attempts"
         echo "    - shorten per-PG scrub time so slots free faster (PG count on the heavy pools)"
         echo "    - narrower EC profile, if the pool is being designed rather than operated"
+        echo
+        echo "  NOT a fix: lowering osd_scrub_interval_randomize_ratio. That RAISES the"
+        echo "  attempt rate (cadence = min_interval x (2 + ratio)/2) and adds demand to a"
+        echo "  cluster that already cannot admit what it generates."
         echo
         echo "  To confirm whether a cap change helped, compare deep-scrub COMPLETIONS"
         echo "  per day before and after. Do not compare f — see Phase 8.2."
@@ -1843,15 +1871,18 @@ _explain_param() {
             echo "simultaneous scrubs per host, verify hosts can absorb the load."
             ;;
         osd_scrub_interval_randomize_ratio)
-            local extra=""
-            if [[ "$current" =~ ^[0-9.]+$ ]] && awk "BEGIN { exit !($current > 1.0) }"; then
-                extra="Your current value ($current) is above the valid maximum of 1.0 and"
-                extra="$extra is likely the dominant cause of scrub backlog: at this ratio,"
-                extra="$extra individual PGs can be deferred for up to $current × min_interval."
-            fi
             echo "Spreads PG scrub eligibility within [interval, interval × (1 + ratio)] to"
-            echo "prevent synchronized scrub storms. Default 0.5; valid range 0.0-1.0."
-            [ -n "$extra" ] && { echo "$extra"; }
+            echo "prevent synchronized scrub storms. Upstream default is 0.5."
+            echo "  Mean attempt cadence = min_interval × (2 + ratio) / 2, so LOWERING this"
+            echo "  raises the scrub-attempt rate. On a cluster whose scrubs are limited by"
+            echo "  reservation admission rather than bandwidth, a high value is protective:"
+            echo "  it throttles attempts that could not be admitted anyway. Only lower it"
+            echo "  when achieved scrub cadence is close to the scheduled cadence."
+            if [[ "$current" =~ ^[0-9.]+$ ]] && awk "BEGIN { exit !($current > 1.0) }"; then
+                echo "  Your current value ($current) is well above the default. That is often"
+                echo "  deliberate on large clusters — check 'ceph config log' for provenance"
+                echo "  before changing it."
+            fi
             ;;
         osd_scrub_begin_hour|osd_scrub_end_hour)
             echo "Active scrub window (hours, 24h clock). 0-0 means scrub anytime."

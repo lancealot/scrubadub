@@ -485,6 +485,37 @@ check     "deep interval still emitted on osd"      "$out" "ceph config set osd 
 check_not "min interval NOT emitted on global"      "$out" "ceph config set global osd_scrub_min_interval"
 
 echo
+echo "Test 21e: interval_randomize_ratio not lowered when admission-limited"
+# Lowering the ratio RAISES attempt rate (cadence = min_iv x (2+ratio)/2).
+# On an admission-limited cluster that adds unservable demand, so a high
+# value is protective and must be preserved.
+out=$(reservation_sampled=1 reservation_f_pct=30 MAX_POOL_WIDTH=20 \
+      current_osd_scrub_interval_randomize_ratio=7.0 \
+      AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>&1)
+check     "admission-limited: high ratio preserved"  "$out" "osd_scrub_interval_randomize_ratio = 7.0"
+check     "preservation explains itself"             "$out" "cannot admit what it generates"
+
+# Healthy admission (f=0 -> P(start)=100%): the default recommendation stands.
+out=$(reservation_sampled=1 reservation_f_pct=0 MAX_POOL_WIDTH=20 \
+      current_osd_scrub_interval_randomize_ratio=7.0 \
+      AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>/dev/null)
+check     "healthy admission: 0.5 still recommended" "$out" "osd_scrub_interval_randomize_ratio = 0.5"
+
+# No reservation data (prompt mode / sampling failed): unchanged behaviour.
+out=$(current_osd_scrub_interval_randomize_ratio=7.0 \
+      AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 10 100 3 24 wpq 2>/dev/null)
+check     "no reservation data: 0.5 recommended"     "$out" "osd_scrub_interval_randomize_ratio = 0.5"
+
+# The admission warning must not tell an admission-limited operator to lower it.
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "warning names deep_scrub_randomize_ratio" "$out" "osd_deep_scrub_randomize_ratio (default 0.15)"
+check     "warning flags the interval-ratio trap"    "$out" "NOT a fix: lowering osd_scrub_interval_randomize_ratio"
+check     "warning warns throughput will fall"       "$out" "throughput to FALL"
+
+echo
 echo "Test 22: admission feasibility — healthy cluster (f=0)"
 # cluster_mclock's reservation fixtures all sit below cap.
 out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
