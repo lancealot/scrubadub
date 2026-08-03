@@ -516,6 +516,27 @@ check     "warning flags the interval-ratio trap"    "$out" "NOT a fix: lowering
 check     "warning warns throughput will fall"       "$out" "throughput to FALL"
 
 echo
+echo "Test 21f: deep-scrub demand model (8.9a)"
+out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+# Fixture: 936 PGs, min_interval 1d, interval ratio 0.5 -> cadence 1.25d,
+# 749 attempts/day; deep interval 14d -> 67/day deadline; x0.15 -> 112/day random.
+check     "demand section renders"                   "$out" "Deep-scrub demand model"
+check     "attempt cadence computed"                 "$out" "Attempt cadence: 1.25 d"
+check     "deadline path labelled irreducible"       "$out" "67 /day   (PGs / 14.0d interval) — IRREDUCIBLE"
+check     "random path computed"                     "$out" "112 /day   (749 attempts/day x 0.15) — tunable"
+check     "random share reported"                    "$out" "random share: 63%"
+check     "smoothing framing present"                "$out" "On a cluster with headroom that is useful smoothing"
+check     "capacity comparison deferred to 8.2"      "$out" "this is a demand figure only"
+# The floor check must catch scrubadub's OWN proposed interval doubling the floor.
+check     "floor warning fires on proposed 7d"       "$out" "raises the irreducible"
+check     "floor warning quantifies it"              "$out" "from 67/day to 134/day"
+check     "floor warning names the real levers"      "$out" "levers are then the"
+
+# Prompt mode has no cluster config; section must not appear.
+out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)
+check_not "prompt mode: no demand model"             "$out" "Deep-scrub demand model"
+
+echo
 echo "Test 22: admission feasibility — healthy cluster (f=0)"
 # cluster_mclock's reservation fixtures all sit below cap.
 out=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)

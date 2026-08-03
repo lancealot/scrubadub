@@ -608,6 +608,16 @@ amplification from `(k+m)/k` and discarded the `(k+m)` that bites.
   mClock-specific field regression (perpetual queuing; tracker #69078)
   and an escape hatch (`osd_scrub_disable_reservation_queuing`).
   Upgrade advice must be scheduler-conditional and validate-first.
+- **Open measurement, load-bearing:** `f` was never re-sampled after
+  the demand-side change. The chain demand ↓ → `f` ↓ → P(start) ↑ →
+  ordering converts is *inferred* from tail-clearance rate and the
+  concurrency drop, not measured. Note precisely what the re-sample
+  tests: both mechanisms require `f` to have fallen, so it confirms
+  the shared **precondition** rather than discriminating between them
+  — the tail-share ratio (2.8–4.8x vs 1.0x) is what separates them.
+  If `f` did *not* fall, both explanations are in trouble and
+  something else cleared the tail. 8.1 already samples it; same
+  33-OSD stride.
 
 **Ground truth from the source cluster (calibration data for 8.2/8.3):**
 deep-scrub durations on EC 16+4 HDD pools (n=1352): p50 3.16h,
@@ -667,18 +677,31 @@ ratio to 0.05 drops demand to 244/day (0.63x).
 cleared**, against a no-improvement decay baseline of 8%; net
 clearance 68–80/day vs a random share of 24/day (2.8–3.3x).
 
-**Why the tail benefits disproportionately (new mechanism).** At
-P(start) ≈ 0.08% every attempt is a near-certain failure, so *which*
-PG a primary selects is irrelevant — outcomes are decided by luck
-across thousands of attempts. At ≈3.9% a primary that picks its
-most-overdue PG actually converts. **Primary-side ordering only bites
-once admission probability is high enough.** This is the causal link
-between lowering demand and preferentially clearing the tail, and it
-explains why the cap (throughput ↑, `f` unchanged) did not clear the
-tail while the demand-side fix did. It also fits queueing intuition:
-0.93x → 0.63x is a move off the saturation knee, where small load
-reductions produce outsized latency improvements — which is why a
-~4.6% change in total slot-hours produced a 42% tail improvement.
+**Why the tail benefits disproportionately — TWO mechanisms, both
+load-bearing.**
+
+*Queueing.* 0.93x → 0.63x is a move off the saturation knee. Mean
+wait scales as ρ/(1−ρ): 13.29 at ρ=0.93, 4.00 at 0.80, 1.70 at 0.63 —
+a 32% demand cut buys a 7.8x improvement in mean wait, superlinear by
+~5.3x. This is why a ~5.4% change in HDD slot-hours produced a 42%
+tail improvement, and it justifies the ~0.8 trigger as a real
+inflection rather than a round number.
+
+*Ordering.* At P(start) ≈ 0.08% every attempt is a near-certain
+failure, so *which* PG a primary selects is irrelevant — outcomes are
+decided by luck across thousands of attempts. At ≈3.9% a primary that
+picks its most-overdue PG actually converts. **Primary-side ordering
+only bites once admission probability is high enough.**
+
+**They make different predictions, and the data separates them.**
+Uniform (queueing-only) improvement gives the tail exactly 1.0x its
+random share by definition. Observed was 2.8–4.8x, while *total*
+deep-scrub throughput simultaneously fell 38% — a rising share of a
+shrinking total is not something a uniform mechanism can produce. So
+ordering is doing real work on top of the queueing gain. Together
+they also explain why the cap (throughput ↑, `f` unchanged, so
+P(start) *worse*) did not clear the tail while the demand-side fix
+did.
 
 **Expected side effects — must ship with the recommendation, or the
 fix reads as a regression:** deep-scrub concurrency fell 794 → 496
@@ -686,13 +709,46 @@ fix reads as a regression:** deep-scrub concurrency fell 794 → 496
 deep-scrub throughput FALLS.** The success metric is tail clearance
 (p99 / max age), not completions/day.
 
-**To implement.** (a) Compute `deep_demand/day` and report the
-random-path fraction explicitly — "48% of your deep scrubs are
-randomly-triggered early scrubs" is the sentence that makes the fix
-obvious; the demand half needs no new ingest beyond reading the
-ratio. (b) Gate the *recommendation* on `demand/capacity > ~0.8` AND
-any pool admission-limited per 8.1 — the capacity denominator is
-8.2's. (c) Emit the side-effects note alongside.
+**THE IRREDUCIBLE FLOOR — check before reaching for the lever.** The
+deadline path is `PGs / deep_interval` and is *not* reducible by
+`osd_deep_scrub_randomize_ratio` at all. A short interval saturates a
+cluster on the deadline path alone and renders the lever useless
+(5216 PGs against 388/day capacity):
+
+| `deep_interval` | Floor/day | vs capacity | Lever viable? |
+|---|---|---|---|
+| 7d | 745 | 1.92x | **no** |
+| 14d | 373 | 0.96x | **no** |
+| 21d | 248 | 0.64x | yes |
+| 28d | 186 | 0.48x | yes |
+
+The reference cluster's 28d interval — non-default and deliberate —
+is what made the lever available. **This makes 8.3 a hard dependency,
+not an adjacent nicety:** scrubadub's hardcoded 7d recommendation
+would raise the floor above capacity and invalidate the very lever
+8.9 recommends. Any output combining a short interval with a lower
+randomize ratio is internally inconsistent.
+
+**Framing requirement.** "48% of your deep scrubs are randomly
+triggered" does not read as neutral, but the random path is doing
+real work on a cluster with headroom — it spreads deep scrubs so they
+do not bunch at the deadline, which is the failure mode the parameter
+exists to prevent. Removing it on a healthy cluster creates deadline
+clustering. The number must ship with: *this is only a problem near
+capacity.*
+
+**Status: 8.9a landed.** `report_deep_scrub_demand()` computes and
+reports attempt cadence, the deadline (irreducible) and random
+(tunable) paths, total demand, and the random share, with the
+smoothing framing and an explicit note that the capacity comparison
+awaits 8.2. The floor check runs against scrubadub's *own* proposed
+interval and warns when it would raise the floor — on the test
+fixture it correctly catches the 7d recommendation doubling the floor
+from 67 to 134/day.
+**8.9b remaining.** Gate the *recommendation* on
+`demand/capacity > ~0.8` AND any pool admission-limited per 8.1 — the
+capacity denominator is 8.2's, computed **per device class** (see the
+denominator note in 8.2). Emit the side-effects note alongside.
 
 **Direction is counterintuitive and must be stated: for wide-EC
 clusters, both randomize ratios move DOWN, and the interval one must
@@ -731,7 +787,26 @@ achievable-concurrency × measured-duration percentiles, with pools
 mapped to classes via CRUSH rule. Completions/day histograms from the
 stamps double as the before/after instrument for any cap or interval
 change. Replaces (not refines) the bandwidth estimate in cluster
-mode; subsumes part of E.1.
+mode; subsumes part of E.1. **Now has three consumers**: 8.9b's
+capacity denominator, 8.4's evaluation instrument, and 8.6's
+conditional cap ceiling.
+
+**Denominator discipline — the same bug class as the original Gap 2.**
+Slot capacity, like throughput, must never be pooled across device
+classes. Wide-EC bulk pools live on HDD; metadata pools on NVMe are a
+separate OSD population with their own `osd_max_scrubs` slots. Sizing
+the reference cluster's freed slot-hours against all 831 OSDs gives
+4.6%; against the 711 HDD OSDs that actually host the EC shards it is
+5.4%. Every ratio computed against an all-OSD denominator is diluted
+by whatever fraction of the cluster is a different class.
+
+**Data source discipline.** Per-PG and per-pool breakdowns must come
+from `pg dump`, never from `ceph health detail` — its `detail` array
+is truncated at `mon_health_max_detail` (default 50), so any
+breakdown derived from it is a sample presented as a census. (This
+error produced a confidently wrong pool attribution during the
+investigation.) `summary.count`, which the backlog ingest already
+uses, is the true count and is unaffected.
 
 ### `[ ]` 8.3 Derive `deep_interval` from measured capacity
 **What.** `max(7d, measured_cycle × ~1.3)` instead of the current

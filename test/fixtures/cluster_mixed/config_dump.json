@@ -1,12 +1,60 @@
 [
-  {"section": "global", "name": "fsid", "value": "00000000-0000-0000-0000-000000000000"},
-  {"section": "osd", "name": "osd_scrub_min_interval", "value": "86400"},
-  {"section": "osd", "name": "osd_scrub_max_interval", "value": "604800"},
-  {"section": "osd", "name": "osd_deep_scrub_interval", "value": "1209600"},
-  {"section": "osd", "name": "osd_max_scrubs", "value": "1"},
-  {"section": "osd", "name": "osd_scrub_sleep", "value": "0.0"},
-  {"section": "osd", "name": "osd_scrub_load_threshold", "value": "0.5"},
-  {"section": "osd", "name": "osd_scrub_begin_hour", "value": "0"},
-  {"section": "osd", "name": "osd_scrub_end_hour", "value": "0"},
-  {"section": "osd", "name": "osd_scrub_interval_randomize_ratio", "value": "0.5"}
+  {
+    "section": "global",
+    "name": "fsid",
+    "value": "00000000-0000-0000-0000-000000000000"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_min_interval",
+    "value": "86400"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_max_interval",
+    "value": "604800"
+  },
+  {
+    "section": "osd",
+    "name": "osd_deep_scrub_interval",
+    "value": "1209600"
+  },
+  {
+    "section": "osd",
+    "name": "osd_max_scrubs",
+    "value": "1"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_sleep",
+    "value": "0.0"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_load_threshold",
+    "value": "0.5"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_begin_hour",
+    "value": "0"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_end_hour",
+    "value": "0"
+  },
+  {
+    "section": "osd",
+    "name": "osd_scrub_interval_randomize_ratio",
+    "value": "0.5"
+  },
+  {
+    "section": "osd",
+    "name": "osd_deep_scrub_randomize_ratio",
+    "value": "0.150000",
+    "level": "advanced",
+    "can_update_at_runtime": true,
+    "mask": ""
+  }
 ]
