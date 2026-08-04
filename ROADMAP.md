@@ -899,6 +899,47 @@ its conjunction ~0.4% of the time, attempts are the scarce resource.
 Pools of width ≥ 11 now get a 24h (0-0) window recommendation with
 the reasoning printed.
 
+### `[x]` 8.13 Admission-limited clusters get the inverted answer
+**Found by running scrubadub against the reference cluster.** The
+Phase 8 sections diagnosed the cluster correctly — 8 pools
+ADMISSION-LIMITED at 0.24%, the floor warning firing — and then the
+recommendations beside them proposed the exact opposite:
+`osd_max_scrubs 8 -> 2` (stripping 75% of the slots), `28d -> 7d`
+(quadrupling the irreducible floor the tool had just warned about),
+and a Notes line claiming a 1:00-6:00 window while proposing 0/0.
+
+Everything upstream of this derives from a bandwidth model. When
+scrubs are gated by reservation admission instead, each of those
+moves either ADDS demand or REMOVES slots:
+
+    shorten deep_interval  -> raises the irreducible deadline floor
+    shorten max_interval   -> more forced shallow scrubs, which take
+                              the SAME width-W reservations as deep
+    lower max_scrubs       -> fewer slots -> f up -> P(start) down
+    raise scrub_sleep      -> each scrub HOLDS its W reservations
+                              longer, which is what f measures
+
+So when reservation sampling shows the widest pool admission-limited,
+scrubadub now holds the current values rather than proposing changes
+its own diagnosis contradicts, each with a notice explaining why.
+Guards fire only when the change would otherwise make things worse;
+on a healthy cluster (f=0) every normal recommendation still stands.
+
+The two fixtures now cover both paths end to end: cluster_mixed is
+admission-limited (EC 8+3 at 1.98%) and yields "no changes"; the
+mclock fixture is healthy (f=0) and still gets the shortened interval.
+
+Also fixed here: the Notes section reported the workload bucket's
+scrub window rather than the one actually proposed, so it contradicted
+the width-aware gate. It now reads the proposed values.
+
+**Sampling precision.** Default `RESERVATION_SAMPLE_SIZE` raised
+30 -> 60. P(start) at large widths is brutally sensitive to `f`: at
+width 20, f=26% gives 0.24% but f=34% gives 0.025% — a 10x swing from
+roughly one standard error at n=30. The report now says plainly that
+the ranking between pools is robust while the absolute percentage is
+not, and that it must not be tracked as a trend.
+
 ### `[ ]` 8.11 Cheap detectors surfaced by the investigation
 Small, independent, each a thing that had to be found by hand:
 - **`max` deep-scrub age as the earliest structural-blockage

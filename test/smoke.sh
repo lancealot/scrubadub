@@ -399,8 +399,13 @@ check     "min_interval shown as no-change"      "$out" "osd_scrub_min_interval:
 # 19b. --why adds Reasoning section.
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed --why --diff 2>&1)
 check     "Reasoning section appears"            "$out" "=== Reasoning ==="
-check     "explains osd_deep_scrub_interval"     "$out" "How often each PG gets a full data-integrity deep-scrub"
-check     "explains osd_scrub_sleep"             "$out" "Pause (seconds, float) between scrub-chunk reads"
+# The mixed fixture is admission-limited, so the interval guards hold its
+# values and there is no interval change left to explain. Use the healthy
+# (f=0) mclock fixture for a changed-parameter explanation, and exercise the
+# sleep text directly since mClock suppresses that knob entirely.
+why_healthy=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed --why --diff 2>&1)
+check     "explains osd_deep_scrub_interval"     "$why_healthy" "How often each PG gets a full data-integrity deep-scrub"
+check     "explains osd_scrub_sleep"             "$(_explain_param osd_scrub_sleep 0.1)" "Pause (seconds, float) between scrub-chunk reads"
 check     "explains class override"              "$out" "Faster device classes don't need the global"
 check     "explains pool override"               "$out" "Metadata/index pool (CephFS metadata by application role"
 check_not "no-change params absent from why"     "$out" "Lower bound for shallow-scrub eligibility"
@@ -479,10 +484,16 @@ check     "width 3: bucket window kept"             "$out" "osd_scrub_begin_hour
 # and the two mgr-visible intervals are emitted on BOTH osd and global.
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
 check     "fixture width 11 triggers window gate"   "$out" "Widest pool needs 11 simultaneous scrub reservations"
-check     "deep interval emitted on global"         "$out" "ceph config set global osd_deep_scrub_interval 604800"
+# This fixture is admission-limited, so the guards hold its 14d deep interval
+# rather than shortening it — the dual-section emit carries the held value.
+check     "deep interval emitted on global"         "$out" "ceph config set global osd_deep_scrub_interval 1209600"
 check     "max interval emitted on global"          "$out" "ceph config set global osd_scrub_max_interval 604800"
-check     "deep interval still emitted on osd"      "$out" "ceph config set osd osd_deep_scrub_interval 604800"
+check     "deep interval still emitted on osd"      "$out" "ceph config set osd osd_deep_scrub_interval 1209600"
 check_not "min interval NOT emitted on global"      "$out" "ceph config set global osd_scrub_min_interval"
+# On the healthy fixture the interval IS shortened, and both sections carry it.
+out_healthy=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "healthy fixture: shortened on global"    "$out_healthy" "ceph config set global osd_deep_scrub_interval 604800"
+check     "healthy fixture: shortened on osd"       "$out_healthy" "ceph config set osd osd_deep_scrub_interval 604800"
 
 echo
 echo "Test 21e: interval_randomize_ratio not lowered when admission-limited"
@@ -516,6 +527,39 @@ check     "warning flags the interval-ratio trap"    "$out" "NOT a fix: lowering
 check     "warning warns throughput will fall"       "$out" "throughput to FALL"
 
 echo
+echo "Test 21g: admission-limited clusters get the inverted answer (8.13)"
+# Reference-cluster inputs: f=26%, width 20 -> P(start) 0.24% (limited),
+# cap already 8, deep 28d, shallow 14d, dense PGs.
+out=$(reservation_sampled=30 reservation_f_pct=26 MAX_POOL_WIDTH=20 \
+      current_osd_max_scrubs=8 \
+      current_osd_deep_scrub_interval=2419200.000000 \
+      current_osd_scrub_max_interval=1209600.000000 \
+      current_osd_scrub_interval_randomize_ratio=7.000000 \
+      AVG_OBJECTS_PER_PG=546563 AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 840 119 1 116 wpq 2>&1)
+check     "does not strip slots (cap held at 8)"     "$out" "osd_max_scrubs = 8"
+check     "cap guard explains itself"                "$out" "fewer slots raise f and lower P(start)"
+check     "deep interval not shortened (28d held)"   "$out" "osd_deep_scrub_interval = 2419200"
+check     "deep guard cites the floor"               "$out" "raises the irreducible deadline floor"
+check     "shallow interval not shortened (14d held)" "$out" "osd_scrub_max_interval = 1209600"
+check     "shallow guard cites shared reservations"  "$out" "same width-20 reservations as deep"
+check     "sleep zeroed when admission-limited"      "$out" "osd_scrub_sleep = 0.0"
+check     "sleep guard cites hold time"              "$out" "holds its width-20 reservations"
+check     "randomize ratio preserved"                "$out" "osd_scrub_interval_randomize_ratio = 7.000000"
+
+# Healthy admission (f=0): every normal recommendation still applies.
+out=$(reservation_sampled=30 reservation_f_pct=0 MAX_POOL_WIDTH=20 \
+      current_osd_max_scrubs=8 \
+      current_osd_deep_scrub_interval=2419200.000000 \
+      current_osd_scrub_max_interval=1209600.000000 \
+      current_osd_scrub_interval_randomize_ratio=7.000000 \
+      AGGRESSIVE_SCRUBS=0 HYPERCONVERGED=0 \
+      calculate_scrub_settings 840 119 1 116 wpq 2>&1)
+check     "healthy: cap recommendation stands"       "$out" "osd_max_scrubs = 2"
+check     "healthy: deep interval shortened"         "$out" "osd_deep_scrub_interval = 604800"
+check_not "healthy: no admission-limited notices"    "$out" "Admission-limited"
+
+echo
 echo "Test 21f: deep-scrub demand model (8.9a)"
 out=$(CEPH_FIXTURE_DIR="$FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
 # Fixture: 936 PGs, min_interval 1d, interval ratio 0.5 -> cadence 1.25d,
@@ -527,10 +571,15 @@ check     "random path computed"                     "$out" "112 /day   (749 att
 check     "random share reported"                    "$out" "random share: 63%"
 check     "smoothing framing present"                "$out" "On a cluster with headroom that is useful smoothing"
 check     "capacity comparison deferred to 8.2"      "$out" "this is a demand figure only"
-# The floor check must catch scrubadub's OWN proposed interval doubling the floor.
-check     "floor warning fires on proposed 7d"       "$out" "raises the irreducible"
-check     "floor warning quantifies it"              "$out" "from 67/day to 134/day"
-check     "floor warning names the real levers"      "$out" "levers are then the"
+# The floor check catches scrubadub's OWN proposed interval raising the floor.
+# It fires on the healthy fixture, where the interval IS shortened...
+out_healthy=$(CEPH_FIXTURE_DIR="$MCLOCK_FIXTURE" "$SB" --from-cluster --workload mixed 2>&1)
+check     "floor warning fires on proposed 7d"       "$out_healthy" "raises the irreducible"
+check     "floor warning quantifies it"              "$out_healthy" "from 65/day to 129/day"
+check     "floor warning names the real levers"      "$out_healthy" "levers are then the"
+# ...and must NOT fire on the admission-limited fixture, where the 8.13 guard
+# already prevented the shortening — there is no bad proposal left to warn about.
+check_not "no floor warning when guard held interval" "$out" "deadline floor from"
 
 # Prompt mode has no cluster config; section must not appear.
 out=$(printf '12\n4\n0\n2400\n800\n3\n' | "$SB" --scheduler wpq 2>&1)

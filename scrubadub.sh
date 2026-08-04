@@ -112,8 +112,11 @@ MAX_POOL_WIDTH=0               # cluster mode: from pool walk; prompt mode: DATA
 AVG_OBJECTS_PER_PG=""          # cluster mode only; empty disables the sleep gate
 declare -a pool_widths=()      # "name|width|pg_num" — populated by ingest_pool_details
 
-# Phase 8.1: reservation sampling.
-RESERVATION_SAMPLE_SIZE=${RESERVATION_SAMPLE_SIZE:-30}
+# Phase 8.1: reservation sampling. 60 rather than 30 because P(start) at
+# large widths is brutally sensitive to f: at width 20, f=26% gives 0.24%
+# but f=34% gives 0.025% — a 10x swing from one standard error at n=30.
+# Sampling is cheap (read-only `tell`, ~100ms each), so buy the precision.
+RESERVATION_SAMPLE_SIZE=${RESERVATION_SAMPLE_SIZE:-60}
 ADMISSION_LIMITED_PCT=${ADMISSION_LIMITED_PCT:-10}    # P(start) below this => admission-limited
 ADMISSION_TIGHT_PCT=${ADMISSION_TIGHT_PCT:-25}        # ...below this => tight
 reservation_sampled=0     # OSDs that answered
@@ -629,22 +632,68 @@ calculate_scrub_settings() {
         print_warning "Verify your hosts can absorb that before applying." >&2
     fi
 
-    # Phase 8.9: do not lower osd_scrub_interval_randomize_ratio on a cluster
-    # whose scrubs are admission-limited. Mean attempt cadence is
-    # min_interval x (2 + ratio)/2, so lowering the ratio RAISES the attempt
-    # rate. On the reference cluster, moving 7.0 -> 0.5 would have taken deep
-    # demand from 0.93x measured capacity to 2.09x — more unservable attempts,
-    # higher f, lower P(start). A high ratio is protective there. Only act when
-    # reservation sampling shows the widest pool is NOT admission-constrained.
+    # -------------------------------------------------------------------
+    # Phase 8.13: admission-limited clusters get a DIFFERENT answer.
+    # -------------------------------------------------------------------
+    # Everything above this point derives from a bandwidth model: shorter
+    # intervals, more concurrency, sleep to protect clients. When scrubs are
+    # gated by reservation admission instead of bandwidth, those moves are
+    # actively harmful, because each one either ADDS demand or REMOVES slots:
+    #
+    #   shorten deep_interval  -> raises the irreducible deadline floor
+    #   shorten max_interval   -> more forced shallow scrubs, which take the
+    #                             SAME width-W reservations as deep scrubs
+    #   lower max_scrubs       -> fewer slots -> f rises -> P(start) falls
+    #   raise scrub_sleep      -> each scrub holds its W reservations LONGER,
+    #                             which is what f measures in the first place
+    #
+    # So when the widest pool is admission-limited, hold the current values
+    # rather than proposing a change that the diagnosis above contradicts.
+    # Each guard fires only when it would otherwise make things worse.
     if [ "${reservation_sampled:-0}" -gt 0 ] && [ "${MAX_POOL_WIDTH:-0}" -ge 1 ]; then
-        local cur_rand="${current_osd_scrub_interval_randomize_ratio:-}"
         local widest_p
         widest_p=$(_p_start_pct "${reservation_f_pct:-0}" "$MAX_POOL_WIDTH")
-        if [[ "$cur_rand" =~ ^[0-9.]+$ ]] \
-           && awk -v c="$cur_rand" -v p="$randomize_ratio" 'BEGIN{exit !(c > p)}' \
-           && awk -v p="$widest_p" -v t="$ADMISSION_TIGHT_PCT" 'BEGIN{exit !(p < t)}'; then
+        local tight=0 limited=0
+        awk -v p="$widest_p" -v t="$ADMISSION_TIGHT_PCT"   'BEGIN{exit !(p < t)}' && tight=1
+        awk -v p="$widest_p" -v t="$ADMISSION_LIMITED_PCT" 'BEGIN{exit !(p < t)}' && limited=1
+
+        # (a) interval_randomize_ratio: lowering raises the attempt rate.
+        local cur_rand="${current_osd_scrub_interval_randomize_ratio:-}"
+        if [ "$tight" -eq 1 ] && [[ "$cur_rand" =~ ^[0-9.]+$ ]] \
+           && awk -v c="$cur_rand" -v p="$randomize_ratio" 'BEGIN{exit !(c > p)}'; then
             print_notice "Widest pool admits at ${widest_p}% per attempt; keeping osd_scrub_interval_randomize_ratio at ${cur_rand} rather than lowering it to ${randomize_ratio} — lowering raises the attempt rate on a cluster that already cannot admit what it generates." >&2
             randomize_ratio="$cur_rand"
+        fi
+
+        if [ "$limited" -eq 1 ]; then
+            # (b) osd_max_scrubs: never propose FEWER slots than the cluster
+            # already has. Slots are the supply side of admission.
+            local cur_ms="${current_osd_max_scrubs%.*}"
+            if [[ "$cur_ms" =~ ^[0-9]+$ ]] && [ "$cur_ms" -gt "$max_scrubs" ]; then
+                print_notice "Admission-limited (${widest_p}% at width ${MAX_POOL_WIDTH}); keeping osd_max_scrubs at ${cur_ms} rather than lowering it to ${max_scrubs} — fewer slots raise f and lower P(start) further. Judge any cap change by deep-scrub completions/day at matched client load, not by f." >&2
+                max_scrubs=$cur_ms
+            fi
+
+            # (c) deep/shallow intervals: never propose a SHORTER interval.
+            # Deep adds to the irreducible deadline floor; shallow adds forced
+            # scrubs that contend for the very same width-W reservations.
+            local cur_deep="${current_osd_deep_scrub_interval%.*}"
+            if [[ "$cur_deep" =~ ^[0-9]+$ ]] && [ "$cur_deep" -gt "$deep_interval" ]; then
+                print_notice "Admission-limited; keeping osd_deep_scrub_interval at $(awk -v d="$cur_deep" 'BEGIN{printf "%.0fd", d/86400}') rather than shortening to $(awk -v d="$deep_interval" 'BEGIN{printf "%.0fd", d/86400}') — a shorter interval raises the irreducible deadline floor (PGs / interval), which no other lever can reduce." >&2
+                deep_interval=$cur_deep
+            fi
+            local cur_max_iv="${current_osd_scrub_max_interval%.*}"
+            if [[ "$cur_max_iv" =~ ^[0-9]+$ ]] && [ "$cur_max_iv" -gt "$max_interval" ]; then
+                print_notice "Admission-limited; keeping osd_scrub_max_interval at $(awk -v d="$cur_max_iv" 'BEGIN{printf "%.0fd", d/86400}') rather than shortening to $(awk -v d="$max_interval" 'BEGIN{printf "%.0fd", d/86400}') — forced shallow scrubs take the same width-${MAX_POOL_WIDTH} reservations as deep scrubs and compete for the same slots." >&2
+                max_interval=$cur_max_iv
+            fi
+
+            # (d) scrub_sleep: sleep extends how long each scrub HOLDS its
+            # reservations, which is exactly what f measures.
+            if awk -v s="$scrub_sleep" 'BEGIN{exit !(s > 0)}'; then
+                print_notice "Admission-limited; setting osd_scrub_sleep to 0.0 instead of ${scrub_sleep} — sleep extends how long each scrub holds its width-${MAX_POOL_WIDTH} reservations, directly raising f." >&2
+                scrub_sleep="0.0"
+            fi
         fi
     fi
 
@@ -1817,6 +1866,9 @@ report_admission_feasibility() {
         echo
         print_notice "(1-f)^W assumes independent slot occupancy. Real placement is more"
         print_notice "clustered, so treat these as a ranking between pools, not a forecast."
+        print_notice "At large widths the absolute figure is also sampling-sensitive — a few"
+        print_notice "points of error in f moves a width-20 estimate several-fold. The"
+        print_notice "ranking is robust; the percentage is not. Do not track it as a trend."
     fi
 }
 
@@ -2422,6 +2474,9 @@ done
 
 # Capture the scrub window for the Notes section (Phase 0.2-aware).
 read -r display_begin display_end <<< "$(scrub_window_for_workload "$WORKLOAD_TYPE")"
+# NOTE: this is the workload bucket's window. calculate_scrub_settings may
+# override it (width-aware gate), so the Notes section re-reads the actually
+# proposed values below rather than trusting these.
 
 # Prompt mode has no pool walk; the declared data factor's numerator IS the
 # acting-set width (k+m for --ec-ratio, size for --replica-size).
@@ -2646,7 +2701,11 @@ fi
 
 echo
 echo "Notes:"
-echo "  1. Active scrub window: ${display_begin}:00–${display_end}:00 (0–0 means 24h)."
+# Report the window we actually proposed, not the workload bucket's default —
+# the width-aware gate may have widened it.
+proposed_begin=$(printf '%s\n' "${proposed_settings[@]}" | awk -F' = ' '/^osd_scrub_begin_hour/ { print $2 }')
+proposed_end=$(printf '%s\n' "${proposed_settings[@]}"   | awk -F' = ' '/^osd_scrub_end_hour/ { print $2 }')
+echo "  1. Active scrub window: ${proposed_begin:-$display_begin}:00–${proposed_end:-$display_end}:00 (0–0 means 24h)."
 echo "  2. osd_scrub_load_threshold is normalized: loadavg / num_cpus. A 16-core"
 echo "     host with threshold 0.5 pauses scrubs when loadavg > 8."
 echo "  3. osd_scrub_sleep is in SECONDS (float). Old scrubadub docs said"
